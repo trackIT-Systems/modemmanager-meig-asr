@@ -4,8 +4,9 @@ ModemManager plugins for ASR-based MeiG modems, packaged for
 [tsOS](https://github.com/trackIT-Systems/tsOS-base). They make the **Teltonika TRM200**
 (MeiG SLM770A inside) work with ModemManager and NetworkManager.
 
-The plugins are built against the exact ModemManager version in the tsOS image
-and dropped into its plugin directory. Debian's `modemmanager` package stays
+The plugins are built against the exact ModemManager version of Raspberry Pi OS
+trixie (arm64), which tsOS is based on, and shipped as a Debian package that adds
+them to ModemManager's plugin directory. Debian's `modemmanager` package stays
 unchanged.
 
 ## Why
@@ -62,8 +63,7 @@ upstream `1.24.0` is ABI-identical to it.
 
 ## Build output
 
-`build.sh` produces `dist/modemmanager-meig-asr-<version>-<arch>.tar.gz`,
-which contains only files (no directory entries) and unpacks onto `/`:
+`build.sh` produces `dist/modemmanager-meig-asr_<version>_<arch>.deb` with:
 
 ```
 usr/lib/aarch64-linux-gnu/ModemManager/libmm-plugin-meig-asr.so
@@ -73,12 +73,24 @@ usr/lib/aarch64-linux-gnu/ModemManager/libmm-shared-meig.so
 usr/lib/udev/rules.d/70-meig-slm770a-ecm-option.rules
 usr/lib/udev/rules.d/77-mm-meig-port-types.rules
 usr/lib/udev/rules.d/77-mm-teltonika-port-types.rules
-usr/share/doc/modemmanager-meig-asr/{BUILDINFO,README.md,LICENSE}
+usr/share/doc/modemmanager-meig-asr/{README.md,copyright,changelog.Debian.gz}
 ```
 
+The package depends on the exact `modemmanager` and `libmm-glib0` version it
+was built against (`MM_DEBIAN_VERSION` in `versions.env`), because the plugins
+use daemon-internal symbols. apt therefore refuses to install it next to any
+other ModemManager. If a later `modemmanager` update arrives, `apt upgrade`
+holds it back, while `apt full-upgrade` would remove this package. Rebuild for
+the new version first (see below).
+
+On a running system, `postinst`/`postrm` reload the udev rules and restart
+ModemManager. In image builds (chroot, no systemd running) they do nothing.
+
 `check-symbols.sh` verifies that every ModemManager symbol the plugins import
-is exported by the installed Debian `modemmanager`/`libmm-glib0`. CI runs it
-on every build.
+is exported by the installed Debian `modemmanager`/`libmm-glib0`. CI runs it on
+every build and test-installs the package on Debian trixie with the Raspberry
+Pi OS archive (`archive.raspberrypi.com`) enabled, i.e. the package set of
+Raspberry Pi OS trixie.
 
 ## Installing in tsOS
 
@@ -87,14 +99,17 @@ In `tsOS-base.Pifile`, after the software installation:
 ```sh
 # Install ModemManager plugins for ASR/MeiG modems (Teltonika TRM200)
 MM_MEIG_ASR_VERSION=1.24.0-1
-RUN sh -c "curl -fsSL https://github.com/trackIT-Systems/modemmanager-meig-asr/releases/download/${MM_MEIG_ASR_VERSION}/modemmanager-meig-asr-${MM_MEIG_ASR_VERSION}-${ARCH}.tar.gz | tar xz -C /"
-RUN sh -c '. /usr/share/doc/modemmanager-meig-asr/BUILDINFO && test "$(dpkg-query -W -f="\${Version}" modemmanager)" = "$mm_debian_version"'
+RUN sh -c "curl -fsSL -o /tmp/modemmanager-meig-asr.deb https://github.com/trackIT-Systems/modemmanager-meig-asr/releases/download/${MM_MEIG_ASR_VERSION}/modemmanager-meig-asr_${MM_MEIG_ASR_VERSION}_${ARCH}.deb"
+RUN apt-get install -y /tmp/modemmanager-meig-asr.deb
+RUN rm /tmp/modemmanager-meig-asr.deb
 ```
 
-The second `RUN` reads the ModemManager version the plugins were built for from
-`BUILDINFO`. It fails the image build if the image's `modemmanager` doesn't match
-it. In that case, see below. Upgrading the plugins only means changing
-`MM_MEIG_ASR_VERSION`.
+`apt-get install` fails the image build if the image's `modemmanager` isn't the
+version the plugins were built for. In that case, see below. Upgrading the
+plugins only means changing `MM_MEIG_ASR_VERSION`.
+
+On any other Raspberry Pi OS trixie (arm64) system, download the `.deb` from the
+release and run `sudo apt install ./modemmanager-meig-asr_<version>_arm64.deb`.
 
 ## When Debian updates ModemManager
 
@@ -113,7 +128,7 @@ Once MR !1502 is merged and shipped by Debian, this repository is obsolete.
 
 ## Building locally
 
-On Debian trixie (or in a `debian:trixie` container):
+On Raspberry Pi OS or Debian trixie, arm64 (or in a `debian:trixie` container):
 
 ```sh
 apt-get install --no-install-recommends \
@@ -140,14 +155,18 @@ revisions:
 1.26.0-1   rebuilt for ModemManager 1.26.0, revision starts again at 1
 ```
 
-The tag tells you which ModemManager a release loads into. The exact Debian
-version it was checked against is in `versions.env` and in the tarball's
-`BUILDINFO`. Tags have no `v` prefix.
+The tag tells you which ModemManager a release loads into, and it is also the
+Debian package version. The exact Debian ModemManager version is in
+`versions.env` and in the package's `Depends`. Tags have no `v` prefix.
+
+Untagged builds (CI on `main`, local builds) get
+`<ModemManager version>-0~git<date>.<commit>`, e.g.
+`1.24.0-0~git20261007.1cd9bb2`, which apt sorts before the first release.
 
 ## Releasing
 
 Add a `## [<tag>]` section to `CHANGELOG.md`, then push the tag. CI builds the
-arm64 tarball and attaches it to a GitHub (pre)release.
+arm64 `.deb` and attaches it to a GitHub (pre)release.
 
 ## Status
 
@@ -169,6 +188,13 @@ with tsOS and Debian's `modemmanager 1.24.0-1+deb13u1`:
 
 Known issues:
 
+* **Data path after reconnects (blocks a release):** the ASR base dials with
+  `+CGACT` only. In RNDIS mode that activates the PDP context but doesn't
+  reliably connect it to `usb0`. After a ModemManager restart (radio off/on),
+  NetworkManager reports a connection with a valid DHCP lease, but no traffic
+  passes. `AT+ECMDUP=<cid>,1` on the same context makes traffic flow
+  immediately. It worked in earlier tests only because the forwarding set up at
+  modem power-on survived. Fix: dial with `AT+ECMDUP` in the MeiG plugin.
 * The first connect after a ModemManager restart once timed out waiting for
   DHCP. NetworkManager's immediate retry succeeded.
 * `ttyUSB3` (GPS) is reported as an unhandled port. There's no location support yet.

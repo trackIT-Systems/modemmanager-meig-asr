@@ -16,22 +16,46 @@ jobs:
   build-arm64:
     runs-on: ubuntu-24.04-arm
     container: debian:trixie
+    env:
+      # Raspberry Pi OS archive signing key, from raspberrypi-archive-keyring
+      # 2025.1+rpt1. The key file published on archive.raspberrypi.com only has
+      # SHA-1 binding signatures, which trixie's apt rejects.
+      RPI_KEY_FPR: CF8A1AF502A2AA2D763BAE7E82B129927FA3303E
     steps:
-      - name: Install build dependencies
+      - name: Install git
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends \
-            build-essential ca-certificates dpkg-dev git gettext \
-            meson ninja-build pkg-config patchelf python3 xsltproc \
-            libdbus-1-dev libglib2.0-dev libgudev-1.0-dev \
-            libmbim-glib-dev libqmi-glib-dev libqrtr-glib-dev \
-            libpolkit-gobject-1-dev libsystemd-dev systemd-dev \
-            modemmanager
+          apt-get install -y --no-install-recommends ca-certificates git gpg
 
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - name: Add the Raspberry Pi OS archive
+        run: |
+          # Same package set as Raspberry Pi OS trixie: Debian plus archive.raspberrypi.com
+          gpg --show-keys --with-colons ci/raspberrypi-archive-keyring.pgp |
+            grep -q "^fpr:::::::::${RPI_KEY_FPR}:"
+          install -m 644 ci/raspberrypi-archive-keyring.pgp /usr/share/keyrings/
+          cat > /etc/apt/sources.list.d/raspi.sources <<EOF
+          Types: deb
+          URIs: http://archive.raspberrypi.com/debian/
+          Suites: trixie
+          Components: main
+          Signed-By: /usr/share/keyrings/raspberrypi-archive-keyring.pgp
+          EOF
+          apt-get update
+
+      - name: Install build dependencies
+        run: |
+          apt-get install -y --no-install-recommends \
+            build-essential dpkg-dev git gettext \
+            meson ninja-build pkg-config patchelf python3 xsltproc \
+            libdbus-1-dev libglib2.0-dev libgudev-1.0-dev \
+            libmbim-glib-dev libqmi-glib-dev libqrtr-glib-dev \
+            libpolkit-gobject-1-dev libsystemd-dev systemd-dev \
+            modemmanager
 
       - name: Build plugins
         run: |
@@ -45,11 +69,16 @@ jobs:
       - name: Check symbols against Debian's modemmanager
         run: ./check-symbols.sh
 
+      - name: Test-install the package
+        run: |
+          apt-get install -y ./dist/*.deb
+          dpkg -L modemmanager-meig-asr
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
           name: modemmanager-meig-asr-arm64
-          path: dist/*.tar.gz
+          path: dist/*.deb
 
       - name: Extract release notes
         id: notes
@@ -76,4 +105,4 @@ jobs:
           prerelease: True
           body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: ${{ steps.notes.outputs.found == 'false' }}
-          files: dist/*.tar.gz
+          files: dist/*.deb
