@@ -13,7 +13,7 @@ TOP=$(cd "$(dirname "$0")" && pwd)
 . "$TOP/versions.env"
 
 NAME=modemmanager-meig-asr
-MAINTAINER="trackIT Systems <hoechst@trackit.systems>"
+MAINTAINER="Jonas Höchst <hoechst@trackit.systems>"
 HOMEPAGE=https://github.com/trackIT-Systems/modemmanager-meig-asr
 
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$TOP" log -1 --format=%ct 2>/dev/null || date +%s)}
