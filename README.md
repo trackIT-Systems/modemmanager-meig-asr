@@ -160,8 +160,10 @@ Debian package version. The exact Debian ModemManager version is in
 `versions.env` and in the package's `Depends`. Tags have no `v` prefix.
 
 Untagged builds (CI on `main`, local builds) get
-`<ModemManager version>-0~git<date>.<commit>`, e.g.
-`1.24.0-0~git20261007.1cd9bb2`, which apt sorts before the first release.
+`<ModemManager version>-0~git<date>.<commit count>.<commit>`, e.g.
+`1.24.0-0~git20261007.10.e814430`, which apt sorts before the first release.
+Builds are only distinguishable by version once committed: rebuilding with
+uncommitted changes reuses the version, and apt won't reinstall it.
 
 ## Releasing
 

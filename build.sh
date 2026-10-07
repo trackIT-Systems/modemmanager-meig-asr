@@ -4,8 +4,9 @@
 #
 # Runs on trixie with the build dependencies from the README installed.
 # usage: ./build.sh [version]
-#   version defaults to the git tag on HEAD, or <MM_TAG>-0~git<date>.<sha>
-#   for untagged builds (sorts before the first release for that MM version).
+#   version defaults to the git tag on HEAD, or <MM_TAG>-0~git<date>.<count>.<sha>
+#   for untagged builds (sorts before the first release for that MM version;
+#   the commit count keeps builds from the same day in order).
 set -eu
 
 TOP=$(cd "$(dirname "$0")" && pwd)
@@ -23,7 +24,7 @@ if [ $# -ge 1 ]; then
 elif tag=$(git -C "$TOP" describe --tags --exact-match 2>/dev/null); then
     VERSION=$tag
 else
-    VERSION="$MM_TAG-0~git$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y%m%d).$(git -C "$TOP" rev-parse --short HEAD)"
+    VERSION="$MM_TAG-0~git$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y%m%d).$(git -C "$TOP" rev-list --count HEAD).$(git -C "$TOP" rev-parse --short HEAD)"
 fi
 dpkg --validate-version "$VERSION"
 
