@@ -12,7 +12,8 @@
 - Skip the `ATZ` init, which ASR MeiG modems reject. Enabling no longer fails at boot, after ModemManager restarts or after inhibition.
 - Add a udev rule that binds the `option` driver to the ECM variant `2dee:4d58`, which the kernel doesn't know.
 - Dial MeiG modems with `+ECMDUP` instead of `+CGACT`, hang up with `+ECMDUP=<cid>,0` and poll the connection status with `+ECMDUP?`. With `+CGACT`, traffic stopped after reconnects or ModemManager restarts while the connection was reported as up.
-- Tested on a Teltonika TRM200 in RNDIS and ECM mode: connects via NetworkManager, IPv4 data works, survives reconnects, ModemManager restarts and re-plugs, and recovers from connection drops.
+- Tested on a Teltonika TRM200: connects via NetworkManager with IPv4 data in RNDIS and ECM mode; reconnects, ModemManager restarts, re-plugs and recovery from connection drops tested in RNDIS mode.
 - Ship the plugins as a Debian package for Raspberry Pi OS trixie (arm64) instead of a tarball. It depends on the exact `modemmanager`/`libmm-glib0` version and reloads udev and ModemManager on install.
 - CI builds against Debian trixie plus the Raspberry Pi OS archive and test-installs the package.
+- Document the package for general use on Raspberry Pi OS trixie (arm64), tested with Raspberry Pi OS Lite 2026-09-15: installation, NetworkManager setup, image builds, compatibility and hardware notes.
 - Version releases as `<ModemManager version>-<revision>`. The first release will be `1.24.0-1`.

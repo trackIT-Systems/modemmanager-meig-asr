@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: tsOS build <build@localhost>
-Date: Wed, 7 Oct 2026 11:55:54 +0200
+From: hoechst <hoechst@trackit.systems>
+Date: Wed, 7 Oct 2026 15:01:34 +0200
 Subject: [PATCH] meig: support the SLM770A in RNDIS mode (2dee:4d57)
 
 The Teltonika TRM200 ships the SLM770A in RNDIS mode (AT+SER=3), which

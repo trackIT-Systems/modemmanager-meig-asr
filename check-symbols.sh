@@ -1,7 +1,7 @@
 #!/bin/sh
 # Verify that every symbol the built plugins import is provided by the installed
 # ModemManager daemon, libmm-glib or another of the built plugins. Catches
-# plugins that would fail to load in the target image.
+# plugins that would fail to load on the target system.
 #
 # Needs the Debian modemmanager package (MM_DEBIAN_VERSION) installed.
 # usage: ./check-symbols.sh
