@@ -40,6 +40,12 @@ if 4 AT secondary, if 5 GPS.
 | 0001–0004 | [ModemManager MR !1502](https://gitlab.freedesktop.org/mobile-broadband/ModemManager/-/merge_requests/1502) ("Add support for Teltonika -> MeiG -> ASR modems", by lvoegl, commit `0076a216`), backported from `main` to 1.24.0 |
 | 0005 | local: plugin-private copy of `mm_3gpp_normalize_address()`, which only exists in MM `main` and isn't exported by the 1.24 daemon |
 | 0006 | local: adds the RNDIS variant `2dee:4d57` (TRM200) |
+| 0007 | local: `MM_DEFINE_SHARED` for `shared-asr`/`shared-meig`. The MR lacks it, so these modules don't load unless plugins are built in |
+
+`build.sh` also makes `libmm-shared-meig.so` depend on `libmm-shared-asr.so`
+(`DT_NEEDED` + `RUNPATH=$ORIGIN`). ModemManager opens shared modules in
+directory order with immediate binding, so `shared-meig` would otherwise fail
+whenever it happens to be opened before `shared-asr`.
 
 The backport leaves daemon code untouched. Only `src/plugins/` and the build
 files change. Debian's `1.24.0-1+deb13u1` only patches the Fibocom plugin, so
@@ -135,15 +141,27 @@ arm64 tarball and attaches it to a GitHub (pre)release.
 
 ## Status
 
-Built and symbol-checked, **not yet tested on hardware**. Open points from the
-TRM200 investigation:
+Tested on a Teltonika TRM200 (firmware `SLM770A_A.57.3_EQ102`) on a Raspberry Pi 5
+with tsOS and Debian's `modemmanager 1.24.0-1+deb13u1`:
 
-* **Dial method:** the ASR base dials with `+CGACT`. On the TRM200 in RNDIS
-  mode, only `AT+ECMDUP=<cid>,1` controlled the network interface in manual tests.
-* **`ATZ`:** the plugins don't skip it yet.
-* **Gateway:** in network-card mode the modem's DHCP gateway is `169.254.0.1`,
-  which is also the tsOS hotspot's address. A gateway-less default route
-  (`default dev usb0`) works because the modem proxy-ARPs everything.
+* The `meig-asr` plugin claims `2dee:4d57`. The modem reports LTE, the packet
+  service is attached, and NetworkManager connects with a normal `gsm`
+  profile (APN only).
+* The plugin dials with `+CGDCONT`/`+CGACT` on cid 2. `usb0` gets a DHCP lease
+  with a /30 or /29 and a real gateway in the carrier network, so there's no
+  clash with the tsOS hotspot. `169.254.0.1` is only the DHCP server identifier.
+* IPv4 traffic works (ping, HTTPS).
+* Enabling works whether or not the modem was hot-plugged. `ATZ` isn't sent.
+
+Known issues:
+
+* The first connect after a ModemManager restart once timed out waiting for
+  DHCP. NetworkManager's immediate retry succeeded.
+* `ttyUSB3` (GPS) is reported as an unhandled port. There's no location support yet.
+* No global IPv6 address on `usb0` with an `ipv4v6` context.
+* On a Pi 5 with the default 600 mA USB current limit, the USB power switch
+  tripped (`over-current change` on all ports) several times and the modem
+  re-enumerated. That's a power-supply issue, not a plugin issue.
 
 ## License
 

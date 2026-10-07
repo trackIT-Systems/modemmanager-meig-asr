@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: tsOS build <build@localhost>
 Date: Wed, 7 Oct 2026 11:55:19 +0200
-Subject: [PATCH 5/6] asr: use a plugin-local address normalizer
+Subject: [PATCH] asr: use a plugin-local address normalizer
 
 mm_3gpp_normalize_address() only exists in ModemManager main. Keep a
 static copy in the ASR helpers so the plugin loads into an unmodified

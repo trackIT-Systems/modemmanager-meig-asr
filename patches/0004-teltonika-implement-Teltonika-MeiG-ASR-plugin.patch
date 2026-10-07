@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Lukas Voegl <lvoegl@tdt.de>
 Date: Thu, 17 Sep 2026 11:28:09 +0200
-Subject: [PATCH 4/6] teltonika: implement Teltonika MeiG ASR plugin
+Subject: [PATCH] teltonika: implement Teltonika MeiG ASR plugin
 
 Implements a plugin for MeiG-ASR based Teltonika modems using shared MeiG utilities.
 

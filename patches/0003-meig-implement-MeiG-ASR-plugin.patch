@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Lukas Voegl <lvoegl@tdt.de>
 Date: Thu, 17 Sep 2026 11:26:51 +0200
-Subject: [PATCH 3/6] meig: implement MeiG ASR plugin
+Subject: [PATCH] meig: implement MeiG ASR plugin
 
 Implements a plugin for ASR based MeiG modems using shared MeiG utilities.
 

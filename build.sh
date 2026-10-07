@@ -68,6 +68,12 @@ for lib in $LIBS; do
     patchelf --remove-rpath "$PLUGINDIR/$lib"
     strip --strip-unneeded "$PLUGINDIR/$lib"
 done
+
+# libmm-shared-meig.so uses symbols from libmm-shared-asr.so. ModemManager
+# opens shared modules in directory order with immediate binding, so make the
+# dependency explicit: the dynamic loader then loads shared-asr first.
+patchelf --add-needed libmm-shared-asr.so --set-rpath '$ORIGIN' \
+    "$PLUGINDIR/libmm-shared-meig.so"
 for rule in $RULES; do
     install -m 644 "$SRC/src/plugins/$rule" "$UDEVDIR/"
 done

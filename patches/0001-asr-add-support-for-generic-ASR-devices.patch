@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Lukas Voegl <lvoegl@tdt.de>
 Date: Mon, 14 Sep 2026 15:56:48 +0200
-Subject: [PATCH 1/6] asr: add support for generic ASR devices
+Subject: [PATCH] asr: add support for generic ASR devices
 
 Implements shared features of ASR Microelectronics based modems, specifically tested with ASR1803.
 

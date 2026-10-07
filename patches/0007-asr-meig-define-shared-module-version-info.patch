@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsOS build <build@localhost>
+Date: Wed, 7 Oct 2026 12:59:51 +0200
+Subject: [PATCH] asr, meig: define shared module version info
+
+ModemManager only loads external shared modules that export
+mm_shared_{major,minor}_version and mm_shared_name, defined via
+MM_DEFINE_SHARED() in each shared module's mm-shared.c. Without it,
+libmm-shared-asr.so is rejected with 'Missing major version info' and
+everything depending on it fails to load. Builds with builtin plugins
+are not affected, which hides the problem.
+---
+ src/plugins/asr/mm-shared.c  | 18 ++++++++++++++++++
+ src/plugins/meig/mm-shared.c | 18 ++++++++++++++++++
+ src/plugins/meson.build      |  2 ++
+ 3 files changed, 38 insertions(+)
+ create mode 100644 src/plugins/asr/mm-shared.c
+ create mode 100644 src/plugins/meig/mm-shared.c
+
+diff --git a/src/plugins/asr/mm-shared.c b/src/plugins/asr/mm-shared.c
+new file mode 100644
+index 00000000..3ff29c21
+--- /dev/null
++++ b/src/plugins/asr/mm-shared.c
+@@ -0,0 +1,18 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#include "mm-shared-common.h"
++
++MM_DEFINE_SHARED (asr)
+diff --git a/src/plugins/meig/mm-shared.c b/src/plugins/meig/mm-shared.c
+new file mode 100644
+index 00000000..5aba5e09
+--- /dev/null
++++ b/src/plugins/meig/mm-shared.c
+@@ -0,0 +1,18 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#include "mm-shared-common.h"
++
++MM_DEFINE_SHARED (meig)
+diff --git a/src/plugins/meson.build b/src/plugins/meson.build
+index 00b51829..0f8cb72e 100644
+--- a/src/plugins/meson.build
++++ b/src/plugins/meson.build
+@@ -75,6 +75,7 @@ if plugins_shared['asr']
+   sources = files(
+     'asr/mm-broadband-bearer-asr.c',
+     'asr/mm-broadband-modem-asr.c',
++    'asr/mm-shared.c',
+   )
+   plugins += {'shared-asr': {
+     'plugin': false,
+@@ -158,6 +159,7 @@ if plugins_shared['meig']
+ 
+   sources = files(
+     'meig/mm-broadband-modem-meig-asr.c',
++    'meig/mm-shared.c',
+   )
+   plugins += {'shared-meig': {
+     'plugin': false,
