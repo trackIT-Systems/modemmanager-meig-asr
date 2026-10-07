@@ -1,0 +1,600 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukas Voegl <lvoegl@tdt.de>
+Date: Thu, 17 Sep 2026 11:25:03 +0200
+Subject: [PATCH 2/6] meig: add common support for ASR MeiG devices
+
+Implements generic features of ASR based MeiG modems.
+
+Signed-off-by: Lukas Voegl <lvoegl@tdt.de>
+---
+ meson.build                                   |   1 +
+ src/plugins/README.txt                        |   4 +
+ .../meig/mm-broadband-modem-meig-asr.c        | 265 ++++++++++++++++++
+ .../meig/mm-broadband-modem-meig-asr.h        |  35 +++
+ src/plugins/meig/mm-modem-helpers-meig.c      |  66 +++++
+ src/plugins/meig/mm-modem-helpers-meig.h      |  32 +++
+ .../meig/tests/test-modem-helpers-meig.c      |  93 ++++++
+ src/plugins/meson.build                       |  17 ++
+ 8 files changed, 513 insertions(+)
+ create mode 100644 src/plugins/meig/mm-broadband-modem-meig-asr.c
+ create mode 100644 src/plugins/meig/mm-broadband-modem-meig-asr.h
+ create mode 100644 src/plugins/meig/mm-modem-helpers-meig.c
+ create mode 100644 src/plugins/meig/mm-modem-helpers-meig.h
+ create mode 100644 src/plugins/meig/tests/test-modem-helpers-meig.c
+
+diff --git a/meson.build b/meson.build
+index 3d8fe5a3..dbcde306 100644
+--- a/meson.build
++++ b/meson.build
+@@ -308,6 +308,7 @@ plugins_shared_reqs = {
+   'fibocom': true,
+   'foxconn': enable_mbim,
+   'icera': true,
++  'meig': true,
+   'mtk': true,
+   'novatel': true,
+   'option': true,
+diff --git a/src/plugins/README.txt b/src/plugins/README.txt
+index 48843028..fc9a633e 100644
+--- a/src/plugins/README.txt
++++ b/src/plugins/README.txt
+@@ -79,6 +79,10 @@ objects created by the plugin is given.
+    ** MMBroadbandModemMbim              (generic)
+    ** MMBroadbandModemMbm
+ 
++ * MeiG ASR:
++   ** MMBroadbandModemMeigAsr           (subclassed from the ASR utils)
++   ** MMBroadbandBearerMeigAsr          (subclassed from the ASR utils)
++
+  * Motorola:
+    ** MMBroadbandModemMotorola
+ 
+diff --git a/src/plugins/meig/mm-broadband-modem-meig-asr.c b/src/plugins/meig/mm-broadband-modem-meig-asr.c
+new file mode 100644
+index 00000000..d1dc0c55
+--- /dev/null
++++ b/src/plugins/meig/mm-broadband-modem-meig-asr.c
+@@ -0,0 +1,265 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#include "ModemManager.h"
++#include <config.h>
++
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-base-modem-at.h"
++#include "mm-broadband-modem-meig-asr.h"
++#include "mm-broadband-modem-asr.h"
++#include "mm-log-object.h"
++#include "mm-modem-helpers-meig.h"
++
++G_DEFINE_TYPE (MMBroadbandModemMeigAsr, mm_broadband_modem_meig_asr, MM_TYPE_BROADBAND_MODEM_ASR)
++
++/*****************************************************************************/
++/* Initialization started (Broadband modem class) */
++
++typedef enum {
++    INITIALIZATION_STEP_FIRST,
++    INITIALIZATION_STEP_NETWORK_CARD_MODE,
++    INITIALIZATION_STEP_LIST_ECMDUP_CONNECTIONS,
++    INITIALIZATION_STEP_DISCONNECT_ECMDUP_CONNECTIONS,
++    INITIALIZATION_STEP_LAST,
++} InitializationStep;
++
++typedef struct {
++    gpointer            parent_context;
++    InitializationStep  step;
++    GArray             *ecmdup_connections;
++    guint               ecmdup_index;
++} InitializationContext;
++
++static void
++initialization_context_free (InitializationContext *ctx)
++{
++    g_clear_pointer (&ctx->ecmdup_connections, g_array_unref);
++    g_slice_free (InitializationContext, ctx);
++}
++
++static gpointer
++initialization_started_finish (MMBroadbandModem  *self,
++                               GAsyncResult      *res,
++                               GError           **error)
++{
++    return g_task_propagate_pointer (G_TASK (res), error);
++}
++
++static void initialization_step (GTask *task);
++
++static void
++disconnect_ecmdup_connection_ready (MMBaseModem  *modem,
++                                    GAsyncResult *res,
++                                    GTask        *task)
++{
++    InitializationContext *ctx;
++    GError                *error = NULL;
++
++    ctx = g_task_get_task_data (task);
++
++    if (!mm_base_modem_at_command_finish (modem, res, &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    /* Do not increment step until all connections are gone */
++    ctx->ecmdup_index++;
++    initialization_step (task);
++}
++
++static void
++list_ecmdup_connections_ready (MMBaseModem  *modem,
++                               GAsyncResult *res,
++                               GTask        *task)
++{
++    MMBroadbandModemMeigAsr *self;
++    InitializationContext   *ctx;
++    const gchar             *response;
++    GError                  *error = NULL;
++
++    self = g_task_get_source_object (task);
++    ctx  = g_task_get_task_data (task);
++
++    response = mm_base_modem_at_command_finish (modem, res, &error);
++    if (!response || !mm_meig_parse_ecmdup_response (response, &ctx->ecmdup_connections, &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    mm_obj_dbg (self, "found %u ECMDUP connection(s) to delete", ctx->ecmdup_connections->len);
++    ctx->step++;
++    initialization_step (task);
++}
++
++static void
++dialcfg_ready (MMBaseModem  *modem,
++               GAsyncResult *res,
++               GTask        *task)
++{
++    InitializationContext *ctx;
++    GError                *error = NULL;
++
++    ctx = g_task_get_task_data (task);
++
++    if (!mm_base_modem_at_command_finish (modem, res, &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    ctx->step++;
++    initialization_step (task);
++}
++
++static void
++initialization_step (GTask *task)
++{
++    MMBroadbandModemMeigAsr *self;
++    InitializationContext   *ctx;
++    g_autofree gchar        *cmd = NULL;
++
++    self = g_task_get_source_object (task);
++    ctx  = g_task_get_task_data (task);
++
++    switch (ctx->step) {
++    case INITIALIZATION_STEP_FIRST:
++        ctx->step++;
++        /* fall through */
++
++    case INITIALIZATION_STEP_NETWORK_CARD_MODE:
++        mm_obj_dbg (self, "setting network card mode to public network...");
++        mm_base_modem_at_command (MM_BASE_MODEM (self),
++                                  "+DIALCFG=\"DIALMODE\",0",
++                                  30,
++                                  FALSE, /* allow_cached */
++                                  (GAsyncReadyCallback) dialcfg_ready,
++                                  task);
++        return;
++
++    case INITIALIZATION_STEP_LIST_ECMDUP_CONNECTIONS:
++        mm_obj_dbg (self, "listing active ECMDUP connections...");
++        mm_base_modem_at_command (MM_BASE_MODEM (self),
++                                  "+ECMDUP?",
++                                  10,
++                                  FALSE, /* allow_cached */
++                                  (GAsyncReadyCallback) list_ecmdup_connections_ready,
++                                  task);
++        return;
++
++    case INITIALIZATION_STEP_DISCONNECT_ECMDUP_CONNECTIONS:
++        if (ctx->ecmdup_index < ctx->ecmdup_connections->len) {
++            guint id;
++
++            id  = g_array_index (ctx->ecmdup_connections, guint, ctx->ecmdup_index);
++            cmd = g_strdup_printf ("+ECMDUP=%u,0", id);
++            mm_obj_dbg (self, "disconnecting ECMDUP connection %u...", id);
++            mm_base_modem_at_command (MM_BASE_MODEM (self),
++                                      cmd,
++                                      10,
++                                      FALSE, /* allow_cached */
++                                      (GAsyncReadyCallback) disconnect_ecmdup_connection_ready,
++                                      task);
++            return;
++        }
++        ctx->step++;
++        /* fall through */
++
++    case INITIALIZATION_STEP_LAST:
++        g_task_return_pointer (task, ctx->parent_context, NULL);
++        g_object_unref (task);
++        return;
++
++    default:
++        g_assert_not_reached ();
++    }
++}
++
++static void
++parent_initialization_started_ready (MMBroadbandModem *self,
++                                     GAsyncResult     *res,
++                                     GTask            *task)
++{
++    InitializationContext *ctx;
++    GError                *error = NULL;
++
++    ctx                 = g_task_get_task_data (task);
++    ctx->parent_context = MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_meig_asr_parent_class)->initialization_started_finish (self, res, &error);
++    if (error) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    initialization_step (task);
++}
++
++static void
++initialization_started (MMBroadbandModem    *self,
++                        GAsyncReadyCallback  callback,
++                        gpointer             user_data)
++{
++    InitializationContext *ctx;
++    GTask                 *task;
++
++    ctx       = g_slice_new0 (InitializationContext);
++    ctx->step = INITIALIZATION_STEP_FIRST;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    g_task_set_task_data (task, ctx, (GDestroyNotify) initialization_context_free);
++
++    MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_meig_asr_parent_class)->initialization_started (self, (GAsyncReadyCallback) parent_initialization_started_ready, task);
++}
++
++/*****************************************************************************/
++
++MMBroadbandModem *
++mm_broadband_modem_meig_asr_new (const gchar  *device,
++                                 const gchar  *physdev,
++                                 const gchar **drivers,
++                                 const gchar  *plugin,
++                                 guint16       vendor_id,
++                                 guint16       product_id)
++{
++    return MM_BROADBAND_MODEM (
++        g_object_new (MM_TYPE_BROADBAND_MODEM_MEIG_ASR,
++                      MM_BASE_MODEM_DEVICE,             device,
++                      MM_BASE_MODEM_PHYSDEV,            physdev,
++                      MM_BASE_MODEM_DRIVERS,            drivers,
++                      MM_BASE_MODEM_PLUGIN,             plugin,
++                      MM_BASE_MODEM_VENDOR_ID,          vendor_id,
++                      MM_BASE_MODEM_PRODUCT_ID,         product_id,
++                      MM_BASE_MODEM_DATA_NET_SUPPORTED, TRUE,
++                      MM_BASE_MODEM_DATA_TTY_SUPPORTED, FALSE,
++                      NULL));
++}
++
++static void
++mm_broadband_modem_meig_asr_init (MMBroadbandModemMeigAsr *self)
++{
++}
++
++static void
++mm_broadband_modem_meig_asr_class_init (MMBroadbandModemMeigAsrClass *klass)
++{
++    MMBroadbandModemClass *broadband_modem_class = MM_BROADBAND_MODEM_CLASS (klass);
++
++    broadband_modem_class->initialization_started        = initialization_started;
++    broadband_modem_class->initialization_started_finish = initialization_started_finish;
++}
+diff --git a/src/plugins/meig/mm-broadband-modem-meig-asr.h b/src/plugins/meig/mm-broadband-modem-meig-asr.h
+new file mode 100644
+index 00000000..1d3647dd
+--- /dev/null
++++ b/src/plugins/meig/mm-broadband-modem-meig-asr.h
+@@ -0,0 +1,35 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#ifndef MM_BROADBAND_MODEM_MEIG_ASR_H
++#define MM_BROADBAND_MODEM_MEIG_ASR_H
++
++#include "mm-broadband-modem-asr.h"
++
++#define MM_TYPE_BROADBAND_MODEM_MEIG_ASR (mm_broadband_modem_meig_asr_get_type ())
++G_DECLARE_FINAL_TYPE (MMBroadbandModemMeigAsr, mm_broadband_modem_meig_asr, MM, BROADBAND_MODEM_MEIG_ASR, MMBroadbandModemAsr)
++
++struct _MMBroadbandModemMeigAsr {
++    MMBroadbandModemAsr parent;
++};
++
++MMBroadbandModem *mm_broadband_modem_meig_asr_new (const gchar  *device,
++                                                   const gchar  *physdev,
++                                                   const gchar **drivers,
++                                                   const gchar  *plugin,
++                                                   guint16       vendor_id,
++                                                   guint16       product_id);
++
++#endif /* MM_BROADBAND_MODEM_MEIG_ASR_H */
+diff --git a/src/plugins/meig/mm-modem-helpers-meig.c b/src/plugins/meig/mm-modem-helpers-meig.c
+new file mode 100644
+index 00000000..1fd794a3
+--- /dev/null
++++ b/src/plugins/meig/mm-modem-helpers-meig.c
+@@ -0,0 +1,66 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#include <glib.h>
++
++#include "mm-modem-helpers-meig.h"
++
++/*****************************************************************************/
++/* +ECMDUP response parser */
++
++gboolean
++mm_meig_parse_ecmdup_response (const gchar  *response,
++                               GArray      **out_connection_ids,
++                               GError      **error)
++{
++    GError                *inner_error    = NULL;
++    g_autoptr(GRegex)      r              = NULL;
++    g_autoptr(GMatchInfo)  match_info     = NULL;
++    g_autoptr(GArray)      connection_ids = NULL;
++
++    r = g_regex_new ("\\+ECMDUP:\\s*(\\d+)(?:,[^\\r\\n]*)?",
++                     G_REGEX_RAW,
++                     0,
++                     NULL);
++    g_assert (r != NULL);
++    connection_ids = g_array_new (FALSE, FALSE, sizeof (guint));
++
++    g_regex_match_full (r, response, strlen (response), 0, 0, &match_info, &inner_error);
++    if (inner_error) {
++        g_propagate_error (error, inner_error);
++        return FALSE;
++    }
++
++    while (g_match_info_matches (match_info)) {
++        guint id = 0;
++
++        if (!mm_get_uint_from_match_info (match_info, 1, &id)) {
++            g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED, "Error parsing +ECMDUP response");
++            return FALSE;
++        }
++        g_array_append_val (connection_ids, id);
++
++        g_match_info_next (match_info, &inner_error);
++        if (inner_error) {
++            g_propagate_error (error, inner_error);
++            return FALSE;
++        }
++    }
++
++    if (out_connection_ids)
++        *out_connection_ids = g_steal_pointer (&connection_ids);
++
++    return TRUE;
++}
+diff --git a/src/plugins/meig/mm-modem-helpers-meig.h b/src/plugins/meig/mm-modem-helpers-meig.h
+new file mode 100644
+index 00000000..5b9c5f8f
+--- /dev/null
++++ b/src/plugins/meig/mm-modem-helpers-meig.h
+@@ -0,0 +1,32 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#ifndef MM_MODEM_HELPERS_MEIG_H
++#define MM_MODEM_HELPERS_MEIG_H
++
++#include <glib.h>
++
++#include <ModemManager.h>
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++/*****************************************************************************/
++/* +ECMDUP response parser */
++
++gboolean mm_meig_parse_ecmdup_response (const gchar  *response,
++                                        GArray      **out_connection_ids,
++                                        GError      **error);
++
++#endif /* MM_MODEM_HELPERS_MEIG_H */
+diff --git a/src/plugins/meig/tests/test-modem-helpers-meig.c b/src/plugins/meig/tests/test-modem-helpers-meig.c
+new file mode 100644
+index 00000000..9269934d
+--- /dev/null
++++ b/src/plugins/meig/tests/test-modem-helpers-meig.c
+@@ -0,0 +1,93 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#include <glib.h>
++#include <glib-object.h>
++#include <locale.h>
++
++#include <ModemManager.h>
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-modem-helpers-meig.h"
++
++/*****************************************************************************/
++/* Test +ECMDUP responses */
++
++typedef struct {
++    const gchar *str;
++    guint        ids[16];
++    guint        ids_n;
++} EcmDupResponseTest;
++
++static const EcmDupResponseTest ecmdup_response_tests[] = {
++    {
++        .str   = "+ECMDUP: 1,1,\"IPV4\",0,\"IPV6\"\r\n",
++        .ids   = { 1 },
++        .ids_n = 1,
++    },
++    {
++        .str   = "\r\n+ECMDUP: 1,1,\"IPV4\",0,\"IPV6\"\r\n"
++                 "\r\n+ECMDUP: 2,0,\"IPV4V6\",1,\"IPV4\"\r\n"
++                 "\r\n+ECMDUP: 3,0,\"IPV4\",0,\"IPV6\"\r\n"
++                 "\r\n+ECMDUP: 5,1,\"IPV4\",0,\"IPV6\"\r\n",
++        .ids   = { 1, 2, 3, 5 },
++        .ids_n = 4,
++    },
++    {
++        .str   = "\r\nOK\r\n",
++        .ids_n = 0,
++    },
++    {
++        .str   = "",
++        .ids_n = 0,
++    },
++};
++
++static void
++test_ecmdup (void)
++{
++    guint i;
++
++    for (i = 0; i < G_N_ELEMENTS (ecmdup_response_tests); i++) {
++        gboolean success;
++        guint    j;
++        g_autoptr(GArray)  connection_ids = NULL;
++        GError            *error          = NULL;
++
++        success = mm_meig_parse_ecmdup_response (ecmdup_response_tests[i].str,
++                                                 &connection_ids,
++                                                 &error);
++        g_assert_no_error (error);
++        g_assert (success);
++        g_assert_cmpuint (connection_ids->len, ==, ecmdup_response_tests[i].ids_n);
++        for (j = 0; j < ecmdup_response_tests[i].ids_n; j++)
++            g_assert_cmpuint (ecmdup_response_tests[i].ids[j], ==, g_array_index (connection_ids, guint, j));
++    }
++}
++
++/*****************************************************************************/
++
++int
++main (int argc, char **argv)
++{
++    setlocale (LC_ALL, "");
++
++    g_test_init (&argc, &argv, NULL);
++
++    g_test_add_func ("/MM/meig/ecmdup", test_ecmdup);
++
++    return g_test_run ();
++}
+diff --git a/src/plugins/meson.build b/src/plugins/meson.build
+index fd4abfc4..789a25bf 100644
+--- a/src/plugins/meson.build
++++ b/src/plugins/meson.build
+@@ -150,6 +150,23 @@ if plugins_shared['icera']
+   }}
+ endif
+ 
++# common MeiG support library
++if plugins_shared['meig']
++  meig_inc = include_directories('meig')
++
++  common_c_args = '-DMM_MODULE_NAME="shared-meig"'
++
++  sources = files(
++    'meig/mm-broadband-modem-meig-asr.c',
++  )
++  plugins += {'shared-meig': {
++    'plugin': false,
++    'helper': {'sources': files('meig/mm-modem-helpers-meig.c'), 'include_directories': plugins_incs + [asr_inc], 'c_args': common_c_args},
++    'module': {'sources': sources, 'include_directories': plugins_incs + [asr_inc], 'c_args': common_c_args},
++    'test': {'sources': files('meig/tests/test-modem-helpers-meig.c'), 'include_directories': meig_inc, 'dependencies': libhelpers_dep},
++  }}
++endif
++
+ # common mtk support library
+ if plugins_shared['mtk']
+   mtk_inc = include_directories('mtk')

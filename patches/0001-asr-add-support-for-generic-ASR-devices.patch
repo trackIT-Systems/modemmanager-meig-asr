@@ -1,0 +1,2220 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukas Voegl <lvoegl@tdt.de>
+Date: Mon, 14 Sep 2026 15:56:48 +0200
+Subject: [PATCH 1/6] asr: add support for generic ASR devices
+
+Implements shared features of ASR Microelectronics based modems, specifically tested with ASR1803.
+
+Signed-off-by: Lukas Voegl <lvoegl@tdt.de>
+---
+ meson.build                                   |   1 +
+ src/plugins/README.txt                        |   4 +
+ src/plugins/asr/mm-broadband-bearer-asr.c     | 612 ++++++++++++++++++
+ src/plugins/asr/mm-broadband-bearer-asr.h     |  41 ++
+ src/plugins/asr/mm-broadband-modem-asr.c      | 576 +++++++++++++++++
+ src/plugins/asr/mm-broadband-modem-asr.h      |  40 ++
+ src/plugins/asr/mm-modem-helpers-asr.c        | 380 +++++++++++
+ src/plugins/asr/mm-modem-helpers-asr.h        |  60 ++
+ .../asr/tests/test-modem-helpers-asr.c        | 385 +++++++++++
+ src/plugins/meson.build                       |  18 +
+ 10 files changed, 2117 insertions(+)
+ create mode 100644 src/plugins/asr/mm-broadband-bearer-asr.c
+ create mode 100644 src/plugins/asr/mm-broadband-bearer-asr.h
+ create mode 100644 src/plugins/asr/mm-broadband-modem-asr.c
+ create mode 100644 src/plugins/asr/mm-broadband-modem-asr.h
+ create mode 100644 src/plugins/asr/mm-modem-helpers-asr.c
+ create mode 100644 src/plugins/asr/mm-modem-helpers-asr.h
+ create mode 100644 src/plugins/asr/tests/test-modem-helpers-asr.c
+
+diff --git a/meson.build b/meson.build
+index 4cccc00a..3d8fe5a3 100644
+--- a/meson.build
++++ b/meson.build
+@@ -304,6 +304,7 @@ enable_gtk_doc = get_option('gtk_doc')
+ enable_plugins = not get_option('auto_features').disabled()
+ 
+ plugins_shared_reqs = {
++  'asr': true,
+   'fibocom': true,
+   'foxconn': enable_mbim,
+   'icera': true,
+diff --git a/src/plugins/README.txt b/src/plugins/README.txt
+index ff36dc41..48843028 100644
+--- a/src/plugins/README.txt
++++ b/src/plugins/README.txt
+@@ -10,6 +10,10 @@ objects created by the plugin is given.
+    ** MMBroadbandModemQmi               (generic)
+    ** MMBroadbandModemAnydata
+ 
++ * ASR (no explicit plugin):
++   ** MMBroadbandModemAsr
++   ** MMBroadbandBearerAsr
++
+  * Cinterion:
+    ** MMBroadbandModemQmiCinterion
+    ** MMBroadbandModemCinterion
+diff --git a/src/plugins/asr/mm-broadband-bearer-asr.c b/src/plugins/asr/mm-broadband-bearer-asr.c
+new file mode 100644
+index 00000000..017dbd28
+--- /dev/null
++++ b/src/plugins/asr/mm-broadband-bearer-asr.c
+@@ -0,0 +1,612 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#include <config.h>
++#include <string.h>
++
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-log-object.h"
++#include "mm-base-modem-at.h"
++#include "mm-broadband-bearer-asr.h"
++#include "mm-modem-helpers-asr.h"
++
++G_DEFINE_TYPE (MMBroadbandBearerAsr, mm_broadband_bearer_asr, MM_TYPE_BROADBAND_BEARER)
++
++enum {
++    PROP_0,
++    PROP_DEFAULT_IP_METHOD,
++    PROP_LAST
++};
++
++static GParamSpec *properties[PROP_LAST];
++
++struct _MMBroadbandBearerAsrPrivate {
++    MMBearerIpMethod default_ip_method;
++};
++
++/*****************************************************************************/
++/* 3GPP Dialing (sub-step of the 3GPP Connection sequence) */
++
++typedef enum {
++    DIAL_3GPP_STEP_FIRST,
++    DIAL_3GPP_STEP_REDEFINE_PDP_CONTEXT,
++    DIAL_3GPP_STEP_AUTHENTICATE,
++    DIAL_3GPP_STEP_ACTIVATE,
++    DIAL_3GPP_STEP_LAST,
++} CustomInitStep;
++
++typedef struct {
++    MMBaseModem    *modem;
++    MMPort         *data;
++    MM3gppProfile  *profile;
++    guint           cid;
++    CustomInitStep  step;
++} CustomInitContext;
++
++static void
++dial_3gpp_context_free (CustomInitContext *ctx)
++{
++    g_clear_object (&ctx->data);
++    g_clear_object (&ctx->profile);
++    g_object_unref (ctx->modem);
++    g_slice_free (CustomInitContext, ctx);
++}
++
++static MMPort *
++dial_3gpp_finish (MMBroadbandBearer *self,
++                  GAsyncResult      *res,
++                  GError           **error)
++{
++    return g_task_propagate_pointer (G_TASK (res), error);
++}
++
++static void dial_3gpp_step (GTask *task);
++
++static void
++dial_3gpp_command_ready (MMBaseModem  *modem,
++                         GAsyncResult *res,
++                         GTask        *task)
++{
++    CustomInitContext *ctx;
++    GError            *error = NULL;
++
++    ctx = g_task_get_task_data (task);
++
++    if (!mm_base_modem_at_command_finish (modem, res, &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    ctx->step++;
++    dial_3gpp_step (task);
++}
++
++static void
++dial_3gpp_step (GTask *task)
++{
++    MMBroadbandBearerAsr *self;
++    CustomInitContext    *ctx;
++    g_autofree gchar     *cmd = NULL;
++
++    self = g_task_get_source_object (task);
++    ctx  = g_task_get_task_data (task);
++
++    /* Don't cancel in last step otherwise we lose track of the PDP context */
++    if (ctx->step != DIAL_3GPP_STEP_LAST && g_task_return_error_if_cancelled (task)) {
++        g_object_unref (task);
++        return;
++    }
++
++    switch (ctx->step) {
++    case DIAL_3GPP_STEP_FIRST:
++        ctx->step++;
++        /* fall through */
++
++    case DIAL_3GPP_STEP_REDEFINE_PDP_CONTEXT: {
++        MMBearerIpFamily  ip_family;
++        const gchar      *apn;
++        g_autofree gchar *quoted_apn = NULL;
++
++        /*
++         * The AT response keeps +CGDCONT definitions across reboots but the underlying layer forgets them.
++         * Always redefine the context before activation.
++         */
++        apn       = mm_3gpp_profile_get_apn (ctx->profile);
++        ip_family = mm_3gpp_profile_get_ip_type (ctx->profile);
++        if (ip_family == MM_BEARER_IP_FAMILY_NONE || ip_family == MM_BEARER_IP_FAMILY_ANY)
++            ip_family = MM_BEARER_IP_FAMILY_IPV4;
++
++        quoted_apn = mm_at_quote_string (apn);
++        cmd        = g_strdup_printf ("+CGDCONT=%u,\"%s\",%s",
++                               ctx->cid,
++                               mm_3gpp_get_pdp_type_from_ip_family (ip_family),
++                               quoted_apn);
++
++        mm_obj_dbg (self, "redefining context #%u before activation...", ctx->cid);
++        mm_base_modem_at_command (ctx->modem,
++                                  cmd,
++                                  10,
++                                  FALSE, /* allow_cached */
++                                  (GAsyncReadyCallback) dial_3gpp_command_ready,
++                                  task);
++        return;
++    }
++
++    case DIAL_3GPP_STEP_AUTHENTICATE: {
++        GError *error = NULL;
++
++        if (!mm_asr_build_authreq_command (ctx->cid,
++                                           mm_base_bearer_peek_config (MM_BASE_BEARER (self)),
++                                           &cmd,
++                                           &error)) {
++            g_task_return_error (task, error);
++            g_object_unref (task);
++            return;
++        }
++
++        mm_obj_dbg (self, "setting up authentication preferences in context #%u...", ctx->cid);
++        mm_base_modem_at_command (ctx->modem,
++                                  cmd,
++                                  10,
++                                  FALSE, /* allow_cached */
++                                  (GAsyncReadyCallback) dial_3gpp_command_ready,
++                                  task);
++        return;
++    }
++
++    case DIAL_3GPP_STEP_ACTIVATE:
++        cmd = g_strdup_printf ("+CGACT=1,%u", ctx->cid);
++        mm_obj_dbg (self, "activating context #%u...", ctx->cid);
++        mm_base_modem_at_command (ctx->modem, cmd, MM_BASE_BEARER_DEFAULT_CONNECTION_TIMEOUT, FALSE, (GAsyncReadyCallback) dial_3gpp_command_ready, task);
++        return;
++
++    case DIAL_3GPP_STEP_LAST:
++        g_task_return_pointer (task, g_object_ref (ctx->data), g_object_unref);
++        g_object_unref (task);
++        return;
++
++    default:
++        g_assert_not_reached ();
++    }
++}
++
++static void
++dial_3gpp (MMBroadbandBearer   *self,
++           MMBaseModem         *modem,
++           MMPortSerialAt      *primary,
++           guint                cid,
++           GCancellable        *cancellable,
++           GAsyncReadyCallback  callback,
++           gpointer             user_data)
++{
++    GTask              *task;
++    CustomInitContext  *ctx;
++    MMBearerProperties *config;
++    MM3gppProfile      *requested_profile;
++
++    ctx        = g_slice_new0 (CustomInitContext);
++    ctx->modem = g_object_ref (modem);
++    ctx->data  = mm_base_modem_get_best_data_port (modem, MM_PORT_TYPE_NET);
++    ctx->cid   = cid;
++    ctx->step  = DIAL_3GPP_STEP_FIRST;
++
++    task = g_task_new (self, cancellable, callback, user_data);
++    g_task_set_task_data (task, ctx, (GDestroyNotify) dial_3gpp_context_free);
++
++    if (!ctx->data) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_NOT_FOUND, "No valid data port found to launch connection");
++        g_object_unref (task);
++        return;
++    }
++
++    config            = mm_base_bearer_peek_config (MM_BASE_BEARER (self));
++    requested_profile = mm_bearer_properties_peek_3gpp_profile (config);
++
++    ctx->profile = g_object_ref (requested_profile);
++    dial_3gpp_step (task);
++}
++
++/*****************************************************************************/
++/* 3GPP IP config (sub-step of the 3GPP Connection sequence) */
++
++typedef struct {
++    MMBaseModem      *modem;
++    MMPort           *data;
++    guint             cid;
++    MMBearerIpConfig *ipv4_config;
++    MMBearerIpConfig *ipv6_config;
++} GetIpConfig3gppContext;
++
++static void
++get_ip_config_3gpp_context_free (GetIpConfig3gppContext *ctx)
++{
++    g_clear_object (&ctx->data);
++    g_clear_object (&ctx->ipv4_config);
++    g_clear_object (&ctx->ipv6_config);
++    g_object_unref (ctx->modem);
++    g_slice_free (GetIpConfig3gppContext, ctx);
++}
++
++static gboolean
++get_ip_config_3gpp_finish (MMBroadbandBearer  *self,
++                           GAsyncResult       *res,
++                           MMBearerIpConfig  **ipv4_config,
++                           MMBearerIpConfig  **ipv6_config,
++                           GError            **error)
++{
++    MMBearerConnectResult *configs;
++    MMBearerIpConfig      *ipv4;
++    MMBearerIpConfig      *ipv6;
++
++    configs = g_task_propagate_pointer (G_TASK (res), error);
++    if (!configs)
++        return FALSE;
++
++    ipv4 = mm_bearer_connect_result_peek_ipv4_config (configs);
++    ipv6 = mm_bearer_connect_result_peek_ipv6_config (configs);
++    g_assert (ipv4 || ipv6);
++    if (ipv4_config && ipv4)
++        *ipv4_config = g_object_ref (ipv4);
++    if (ipv6_config && ipv6)
++        *ipv6_config = g_object_ref (ipv6);
++
++    mm_bearer_connect_result_unref (configs);
++    return TRUE;
++}
++
++static void
++cgcontrdp_ready (MMBaseModem  *modem,
++                 GAsyncResult *res,
++                 GTask        *task)
++{
++    GetIpConfig3gppContext *ctx;
++    const gchar            *response;
++    GError                 *error = NULL;
++
++    ctx = g_task_get_task_data (task);
++
++    response = mm_base_modem_at_command_finish (modem, res, &error);
++    if (!response || !mm_asr_cgcontrdp_response_set_dns (response,
++                                                         ctx->ipv4_config,
++                                                         ctx->ipv6_config,
++                                                         &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    g_task_return_pointer (task,
++                           mm_bearer_connect_result_new (ctx->data,
++                                                         ctx->ipv4_config,
++                                                         ctx->ipv6_config),
++                           (GDestroyNotify) mm_bearer_connect_result_unref);
++    g_object_unref (task);
++}
++
++static void
++getip_ready (MMBaseModem  *modem,
++             GAsyncResult *res,
++             GTask        *task)
++{
++    MMBroadbandBearerAsr   *self;
++    GetIpConfig3gppContext *ctx;
++    const gchar            *response;
++    GError                 *error              = NULL;
++    g_autofree gchar       *cmd                = NULL;
++    g_autofree gchar       *local_ipv4_address = NULL;
++    g_autofree gchar       *local_ipv6_address = NULL;
++    g_autofree gchar       *gw_ipv4_address    = NULL;
++    g_autofree gchar       *gw_ipv6_address    = NULL;
++
++    self = g_task_get_source_object (task);
++    ctx  = g_task_get_task_data (task);
++
++    response = mm_base_modem_at_command_finish (modem, res, &error);
++    if (!response || !mm_asr_parse_getip_response (response,
++                                                   &local_ipv4_address,
++                                                   &gw_ipv4_address,
++                                                   &local_ipv6_address,
++                                                   &gw_ipv6_address,
++                                                   NULL, /* apn */
++                                                   &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    if (ctx->ipv4_config) {
++        mm_bearer_ip_config_set_method (ctx->ipv4_config, MM_BEARER_IP_METHOD_STATIC);
++        mm_bearer_ip_config_set_prefix (ctx->ipv4_config, MM_ASR_DEFAULT_IPV4_PREFIX);
++
++        if (local_ipv4_address) {
++            mm_obj_dbg (self, "IPv4 address retrieved: %s", local_ipv4_address);
++            mm_bearer_ip_config_set_address (ctx->ipv4_config, local_ipv4_address);
++        }
++        if (gw_ipv4_address && ctx->ipv4_config) {
++            mm_obj_dbg (self, "IPv4 gateway address retrieved: %s", gw_ipv4_address);
++            mm_bearer_ip_config_set_gateway (ctx->ipv4_config, gw_ipv4_address);
++        }
++    }
++    if (ctx->ipv6_config) {
++        mm_bearer_ip_config_set_method (ctx->ipv6_config, MM_BEARER_IP_METHOD_STATIC);
++        mm_bearer_ip_config_set_prefix (ctx->ipv6_config, MM_ASR_DEFAULT_IPV6_PREFIX);
++
++        if (local_ipv6_address) {
++            mm_obj_dbg (self, "IPv6 address retrieved: %s", local_ipv6_address);
++            mm_bearer_ip_config_set_address (ctx->ipv6_config, local_ipv6_address);
++        }
++
++        if (gw_ipv6_address) {
++            mm_obj_dbg (self, "IPv6 gateway address retrieved: %s", gw_ipv6_address);
++            mm_bearer_ip_config_set_gateway (ctx->ipv6_config, gw_ipv6_address);
++        }
++    }
++
++    cmd = g_strdup_printf ("+CGCONTRDP=%u", ctx->cid);
++    mm_obj_dbg (self, "gathering IP and DNS information for context #%u...", ctx->cid);
++    mm_base_modem_at_command (MM_BASE_MODEM (modem),
++                              cmd,
++                              10,
++                              FALSE,
++                              (GAsyncReadyCallback) cgcontrdp_ready,
++                              task);
++}
++
++static void
++get_ip_config_3gpp (MMBroadbandBearer   *_self,
++                    MMBroadbandModem    *modem,
++                    MMPortSerialAt      *primary,
++                    MMPortSerialAt      *secondary,
++                    MMPort              *data,
++                    guint                cid,
++                    MMBearerIpFamily     ip_family,
++                    GAsyncReadyCallback  callback,
++                    gpointer             user_data)
++{
++    MMBroadbandBearerAsr   *self;
++    GetIpConfig3gppContext *ctx;
++    GTask                  *task;
++    g_autofree gchar       *command = NULL;
++
++    self = MM_BROADBAND_BEARER_ASR (_self);
++
++    ctx        = g_slice_new0 (GetIpConfig3gppContext);
++    ctx->modem = g_object_ref (MM_BASE_MODEM (modem));
++    ctx->data  = g_object_ref (data);
++    ctx->cid   = cid;
++
++    if (ip_family & MM_BEARER_IP_FAMILY_IPV4 || ip_family & MM_BEARER_IP_FAMILY_IPV4V6)
++        ctx->ipv4_config = mm_bearer_ip_config_new ();
++    if (ip_family & MM_BEARER_IP_FAMILY_IPV6 || ip_family & MM_BEARER_IP_FAMILY_IPV4V6)
++        ctx->ipv6_config = mm_bearer_ip_config_new ();
++    g_assert (ctx->ipv4_config || ctx->ipv6_config);
++
++    task = g_task_new (self, NULL, callback, user_data);
++    g_task_set_task_data (
++        task,
++        ctx,
++        (GDestroyNotify) get_ip_config_3gpp_context_free);
++
++    if (!ctx->data) {
++        g_task_return_new_error (task,
++                                 MM_CORE_ERROR,
++                                 MM_CORE_ERROR_NOT_FOUND,
++                                 "No valid data port found to launch connection");
++        g_object_unref (task);
++        return;
++    }
++
++    if (self->priv->default_ip_method == MM_BEARER_IP_METHOD_STATIC) {
++        command = g_strdup_printf ("+GETIP=%u", ctx->cid);
++        mm_obj_dbg (self, "loading static IP configuration for context #%u...", ctx->cid);
++        mm_base_modem_at_command (ctx->modem,
++                                  command,
++                                  15,
++                                  FALSE,
++                                  (GAsyncReadyCallback) getip_ready,
++                                  task);
++        return;
++    }
++
++    if (self->priv->default_ip_method == MM_BEARER_IP_METHOD_DHCP) {
++        MMBearerConnectResult *connect_result;
++
++        if (ctx->ipv4_config)
++            mm_bearer_ip_config_set_method (ctx->ipv4_config, MM_BEARER_IP_METHOD_DHCP);
++        if (ctx->ipv6_config)
++            mm_bearer_ip_config_set_method (ctx->ipv6_config, MM_BEARER_IP_METHOD_DHCP);
++
++        connect_result = mm_bearer_connect_result_new (MM_PORT (ctx->data),
++                                                       ctx->ipv4_config,
++                                                       ctx->ipv6_config);
++        g_task_return_pointer (task,
++                               connect_result,
++                               (GDestroyNotify) mm_bearer_connect_result_unref);
++        g_object_unref (task);
++        return;
++    }
++
++    g_assert_not_reached ();
++}
++
++/*****************************************************************************/
++/* 3GPP disconnect */
++
++static gboolean
++disconnect_3gpp_finish (MMBroadbandBearer  *self,
++                        GAsyncResult       *res,
++                        GError            **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++cgact_deactivate_ready (MMBaseModem  *modem,
++                        GAsyncResult *res,
++                        GTask        *task)
++{
++    GError *error = NULL;
++
++    if (!mm_base_modem_at_command_finish (modem, res, &error))
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static void
++disconnect_3gpp (MMBroadbandBearer   *self,
++                 MMBroadbandModem    *modem,
++                 MMPortSerialAt      *primary,
++                 MMPortSerialAt      *secondary,
++                 MMPort              *data,
++                 guint                cid,
++                 GAsyncReadyCallback  callback,
++                 gpointer             user_data)
++{
++    GTask            *task;
++    g_autofree gchar *cmd = NULL;
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    cmd = g_strdup_printf ("+CGACT=0,%u", cid);
++    mm_obj_dbg (self, "deactivating PDP context #%u...", cid);
++    mm_base_modem_at_command (MM_BASE_MODEM (modem),
++                              cmd,
++                              MM_BASE_BEARER_DEFAULT_DISCONNECTION_TIMEOUT,
++                              FALSE,
++                              (GAsyncReadyCallback) cgact_deactivate_ready,
++                              task);
++}
++
++/*****************************************************************************/
++
++MMBaseBearer *
++mm_broadband_bearer_asr_new_finish (GAsyncResult  *res,
++                                    GError       **error)
++{
++    GObject *bearer;
++    GObject *source;
++
++    source = g_async_result_get_source_object (res);
++    bearer = g_async_initable_new_finish (G_ASYNC_INITABLE (source), res, error);
++    g_object_unref (source);
++
++    if (!bearer)
++        return NULL;
++
++    /* Only export valid bearers */
++    mm_base_bearer_export (MM_BASE_BEARER (bearer));
++
++    return MM_BASE_BEARER (bearer);
++}
++
++void
++mm_broadband_bearer_asr_new (MMBroadbandModem    *modem,
++                             MMBearerIpMethod     ip_method,
++                             MMBearerProperties  *config,
++                             GCancellable        *cancellable,
++                             GAsyncReadyCallback  callback,
++                             gpointer             user_data)
++{
++    g_async_initable_new_async (
++        MM_TYPE_BROADBAND_BEARER_ASR,
++        G_PRIORITY_DEFAULT,
++        cancellable,
++        callback,
++        user_data,
++        MM_BASE_BEARER_MODEM,                      modem,
++        MM_BASE_BEARER_CONFIG,                     config,
++        MM_BROADBAND_BEARER_ASR_DEFAULT_IP_METHOD, ip_method,
++        NULL);
++}
++
++static void
++set_property (GObject      *object,
++              guint         prop_id,
++              const GValue *value,
++              GParamSpec   *pspec)
++{
++    MMBroadbandBearerAsr *self = MM_BROADBAND_BEARER_ASR (object);
++
++    switch (prop_id) {
++    case PROP_DEFAULT_IP_METHOD:
++        self->priv->default_ip_method = g_value_get_enum (value);
++        break;
++    default:
++        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++        break;
++    }
++}
++
++static void
++get_property (GObject    *object,
++              guint       prop_id,
++              GValue     *value,
++              GParamSpec *pspec)
++{
++    MMBroadbandBearerAsr *self = MM_BROADBAND_BEARER_ASR (object);
++
++    switch (prop_id) {
++    case PROP_DEFAULT_IP_METHOD:
++        g_value_set_enum (value, self->priv->default_ip_method);
++        break;
++    default:
++        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++        break;
++    }
++}
++
++static void
++mm_broadband_bearer_asr_init (MMBroadbandBearerAsr *self)
++{
++    /* Initialize private data */
++    self->priv = G_TYPE_INSTANCE_GET_PRIVATE (self,
++                                              MM_TYPE_BROADBAND_BEARER_ASR,
++                                              MMBroadbandBearerAsrPrivate);
++
++    /* Defaults */
++    self->priv->default_ip_method = MM_BEARER_IP_METHOD_DHCP;
++}
++
++static void
++mm_broadband_bearer_asr_class_init (MMBroadbandBearerAsrClass *klass)
++{
++    GObjectClass           *object_class           = G_OBJECT_CLASS (klass);
++    MMBroadbandBearerClass *broadband_bearer_class = MM_BROADBAND_BEARER_CLASS (klass);
++
++    g_type_class_add_private (object_class, sizeof (MMBroadbandBearerAsrPrivate));
++
++    object_class->get_property                        = get_property;
++    object_class->set_property                        = set_property;
++    broadband_bearer_class->dial_3gpp                 = dial_3gpp;
++    broadband_bearer_class->dial_3gpp_finish          = dial_3gpp_finish;
++    broadband_bearer_class->get_ip_config_3gpp        = get_ip_config_3gpp;
++    broadband_bearer_class->get_ip_config_3gpp_finish = get_ip_config_3gpp_finish;
++    broadband_bearer_class->disconnect_3gpp           = disconnect_3gpp;
++    broadband_bearer_class->disconnect_3gpp_finish    = disconnect_3gpp_finish;
++
++    properties[PROP_DEFAULT_IP_METHOD] =
++        g_param_spec_enum (MM_BROADBAND_BEARER_ASR_DEFAULT_IP_METHOD,
++                           "Default IP method",
++                           "Default IP Method (static or DHCP) to use.",
++                           MM_TYPE_BEARER_IP_METHOD,
++                           MM_BEARER_IP_METHOD_DHCP,
++                           G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY);
++    g_object_class_install_property (object_class, PROP_DEFAULT_IP_METHOD, properties[PROP_DEFAULT_IP_METHOD]);
++}
+diff --git a/src/plugins/asr/mm-broadband-bearer-asr.h b/src/plugins/asr/mm-broadband-bearer-asr.h
+new file mode 100644
+index 00000000..5084ac30
+--- /dev/null
++++ b/src/plugins/asr/mm-broadband-bearer-asr.h
+@@ -0,0 +1,41 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * Copyright (C) 2026
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef MM_BROADBAND_BEARER_ASR_H
++#define MM_BROADBAND_BEARER_ASR_H
++
++#include "mm-broadband-bearer.h"
++#include "mm-broadband-modem.h"
++
++#define MM_TYPE_BROADBAND_BEARER_ASR (mm_broadband_bearer_asr_get_type ())
++G_DECLARE_FINAL_TYPE (MMBroadbandBearerAsr, mm_broadband_bearer_asr, MM, BROADBAND_BEARER_ASR, MMBroadbandBearer)
++
++#define MM_BROADBAND_BEARER_ASR_DEFAULT_IP_METHOD "broadband-bearer-asr-default-ip-method"
++
++typedef struct _MMBroadbandBearerAsrPrivate MMBroadbandBearerAsrPrivate;
++
++struct _MMBroadbandBearerAsr {
++    MMBroadbandBearer            parent;
++    MMBroadbandBearerAsrPrivate *priv;
++};
++
++#define MM_ASR_DEFAULT_IPV4_PREFIX 32
++#define MM_ASR_DEFAULT_IPV6_PREFIX 64
++
++void          mm_broadband_bearer_asr_new (MMBroadbandModem    *modem,
++                                           MMBearerIpMethod     ip_method,
++                                           MMBearerProperties  *config,
++                                           GCancellable        *cancellable,
++                                           GAsyncReadyCallback  callback,
++                                           gpointer             user_data);
++MMBaseBearer *mm_broadband_bearer_asr_new_finish (GAsyncResult  *res,
++                                                  GError       **error);
++
++#endif /* MM_BROADBAND_BEARER_ASR_H */
+diff --git a/src/plugins/asr/mm-broadband-modem-asr.c b/src/plugins/asr/mm-broadband-modem-asr.c
+new file mode 100644
+index 00000000..fb336a4c
+--- /dev/null
++++ b/src/plugins/asr/mm-broadband-modem-asr.c
+@@ -0,0 +1,576 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#include <config.h>
++
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-log-object.h"
++#include "mm-base-modem-at.h"
++#include "mm-broadband-bearer-asr.h"
++#include "mm-broadband-modem-asr.h"
++#include "mm-iface-modem-3gpp-profile-manager.h"
++#include "mm-iface-modem.h"
++#include "mm-modem-helpers-asr.h"
++
++static void iface_modem_init                      (MMIfaceModemInterface                   *iface);
++static void iface_modem_3gpp_init                 (MMIfaceModem3gppInterface               *iface);
++static void iface_modem_3gpp_profile_manager_init (MMIfaceModem3gppProfileManagerInterface *iface);
++
++static MMIfaceModemInterface                   *iface_modem_parent;
++static MMIfaceModem3gppInterface               *iface_modem_3gpp_parent;
++static MMIfaceModem3gppProfileManagerInterface *iface_modem_3gpp_profile_manager_parent;
++
++G_DEFINE_TYPE_EXTENDED (MMBroadbandModemAsr, mm_broadband_modem_asr, MM_TYPE_BROADBAND_MODEM, 0,
++                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM, iface_modem_init)
++                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_3GPP, iface_modem_3gpp_init)
++                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_3GPP_PROFILE_MANAGER, iface_modem_3gpp_profile_manager_init))
++
++enum {
++    PROP_0,
++    PROP_DEFAULT_IP_METHOD,
++    PROP_LAST
++};
++
++static GParamSpec *properties[PROP_LAST];
++
++struct _MMBroadbandModemAsrPrivate {
++    MMBearerIpMethod  default_ip_method;
++    GRegex           *connect_regex;
++};
++
++/*****************************************************************************/
++/* Load current capabilities (Modem interface) */
++static MMModemCapability
++load_current_capabilities_finish (MMIfaceModem *self,
++                                  GAsyncResult *res,
++                                  GError      **error)
++{
++    return g_task_propagate_int (G_TASK (res), error);
++}
++
++static void
++cereg_test_ready (MMBaseModem  *self,
++                  GAsyncResult *res,
++                  GTask        *task)
++{
++    MMModemCapability  caps;
++    GError            *error = NULL;
++
++    caps = GPOINTER_TO_UINT (g_task_get_task_data (task));
++
++    mm_base_modem_at_command_finish (self, res, &error);
++    if (!error)
++        caps |= MM_MODEM_CAPABILITY_LTE;
++    else
++        g_clear_error (&error);
++
++    g_task_return_int (task, caps);
++    g_object_unref (task);
++}
++
++static void
++parent_load_current_capabilities_ready (MMIfaceModem *self,
++                                        GAsyncResult *res,
++                                        GTask        *task)
++{
++    MMModemCapability  caps;
++    GError            *error = NULL;
++
++    caps = iface_modem_parent->load_current_capabilities_finish (
++        self, res, &error);
++
++    if (error) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    if (caps & MM_MODEM_CAPABILITY_LTE) {
++        g_task_return_int (task, caps);
++        g_object_unref (task);
++        return;
++    }
++
++    /* Some ASR devices don't report LTE support by themselves
++       therefore try querying manually */
++    g_task_set_task_data (task, GUINT_TO_POINTER (caps), NULL);
++
++    mm_base_modem_at_command (
++        MM_BASE_MODEM (self),
++        "+CEREG=?",
++        3,
++        TRUE,
++        (GAsyncReadyCallback) cereg_test_ready,
++        task);
++}
++
++static void
++load_current_capabilities (MMIfaceModem        *self,
++                           GAsyncReadyCallback  callback,
++                           gpointer             user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    iface_modem_parent->load_current_capabilities (
++        self,
++        (GAsyncReadyCallback) parent_load_current_capabilities_ready,
++        task);
++}
++
++/*****************************************************************************/
++/* Bearer creation */
++
++static MMBaseBearer *
++modem_create_bearer_finish (MMIfaceModem  *self,
++                            GAsyncResult  *res,
++                            GError       **error)
++{
++    return g_task_propagate_pointer (G_TASK (res), error);
++}
++
++static void
++bearer_new_ready (GObject      *source,
++                  GAsyncResult *res,
++                  GTask        *task)
++{
++    MMBaseBearer      *bearer;
++    g_autoptr(GError)  error = NULL;
++
++    bearer = mm_broadband_bearer_asr_new_finish (res, &error);
++    if (!bearer)
++        g_task_return_error (task, g_steal_pointer (&error));
++    else
++        g_task_return_pointer (task, bearer, g_object_unref);
++    g_object_unref (task);
++}
++
++static void
++modem_create_bearer (MMIfaceModem        *self,
++                     MMBearerProperties  *bearer_properties,
++                     GAsyncReadyCallback  callback,
++                     gpointer             user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    mm_broadband_bearer_asr_new (MM_BROADBAND_MODEM (self),
++                                 MM_BROADBAND_MODEM_ASR (self)->priv->default_ip_method,
++                                 bearer_properties,
++                                 NULL,
++                                 (GAsyncReadyCallback) bearer_new_ready,
++                                 task);
++}
++
++/*****************************************************************************/
++/* Power down */
++
++static gboolean
++modem_power_down_finish (MMIfaceModem  *self,
++                         GAsyncResult  *res,
++                         GError       **error)
++{
++    return !!mm_base_modem_at_command_finish (MM_BASE_MODEM (self), res, error);
++}
++
++static void
++modem_power_down (MMIfaceModem        *self,
++                  GAsyncReadyCallback  callback,
++                  gpointer             user_data)
++{
++    mm_base_modem_at_command (MM_BASE_MODEM (self), "+CFUN=4", 20, FALSE, callback, user_data);
++}
++
++/*****************************************************************************/
++/* Set initial EPS bearer settings (3GPP interface) */
++
++static gboolean
++modem_3gpp_set_initial_eps_bearer_settings_finish (MMIfaceModem3gpp  *self,
++                                                   GAsyncResult      *res,
++                                                   GError           **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++set_initial_eps_authreq_ready (MMBaseModem  *self,
++                               GAsyncResult *res,
++                               GTask        *task)
++{
++    GError *error = NULL;
++
++    if (!mm_base_modem_at_command_finish (self, res, &error))
++        g_task_return_error (task, error);
++    else
++        g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static void
++set_initial_eps_bearer_settings_parent_ready (MMIfaceModem3gpp *self,
++                                              GAsyncResult     *res,
++                                              GTask            *task)
++{
++    MMBearerProperties *bearer_properties;
++    gint                cid;
++    g_autofree gchar   *cmd   = NULL;
++    GError             *error = NULL;
++
++    if (!iface_modem_3gpp_parent->set_initial_eps_bearer_settings_finish (self, res, &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    cid = mm_broadband_modem_get_initial_eps_bearer_cid (MM_BROADBAND_MODEM (self));
++    g_assert (cid >= 0);
++
++    bearer_properties = g_task_get_task_data (task);
++    if (!mm_asr_build_authreq_command ((guint) cid, bearer_properties, &cmd, &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    mm_obj_dbg (self, "setting initial EPS bearer authentication in context #%d...", cid);
++    mm_base_modem_at_command (MM_BASE_MODEM (self), cmd, 10, FALSE, (GAsyncReadyCallback) set_initial_eps_authreq_ready, task);
++}
++
++static void
++modem_3gpp_set_initial_eps_bearer_settings (MMIfaceModem3gpp    *self,
++                                            MMBearerProperties  *bearer_properties,
++                                            GAsyncReadyCallback  callback,
++                                            gpointer             user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    g_task_set_task_data (task, g_object_ref (bearer_properties), g_object_unref);
++
++    iface_modem_3gpp_parent->set_initial_eps_bearer_settings (
++        self, bearer_properties, (GAsyncReadyCallback) set_initial_eps_bearer_settings_parent_ready, task);
++}
++
++/*****************************************************************************/
++/* Check format (3gppProfileManager interface) */
++
++static gboolean
++modem_3gpp_profile_manager_check_format_finish (MMIfaceModem3gppProfileManager  *_self,
++                                                GAsyncResult                    *res,
++                                                gboolean                        *new_id,
++                                                gint                            *min_profile_id,
++                                                gint                            *max_profile_id,
++                                                GEqualFunc                      *apn_cmp,
++                                                MM3gppProfileCmpFlags           *profile_cmp_flags,
++                                                GError                         **error)
++{
++    gint     asr_min_profile_id;
++    gboolean success;
++
++    success = iface_modem_3gpp_profile_manager_parent->check_format_finish (_self, res, new_id, &asr_min_profile_id, max_profile_id, apn_cmp, profile_cmp_flags, error);
++    if (!success)
++        return FALSE;
++
++    /* +CGDCONT=? reports min id 0, but in reality 0 doesn't work */
++    asr_min_profile_id = MAX (asr_min_profile_id, 1);
++    if (min_profile_id)
++        *min_profile_id = asr_min_profile_id;
++
++    return TRUE;
++}
++
++/*****************************************************************************/
++/* Initialization started (Broadband modem class) */
++
++typedef struct {
++    gpointer parent_context;
++} InitializationContext;
++
++static void
++initialization_context_free (InitializationContext *ctx)
++{
++    g_slice_free (InitializationContext, ctx);
++}
++
++static gpointer
++initialization_started_finish (MMBroadbandModem  *self,
++                               GAsyncResult      *res,
++                               GError           **error)
++{
++    return g_task_propagate_pointer (G_TASK (res), error);
++}
++
++static void
++dialmode_ready (MMPortSerialAt *port,
++                GAsyncResult   *res,
++                GTask          *task)
++{
++    InitializationContext *ctx;
++    GError                *error = NULL;
++
++    ctx = g_task_get_task_data (task);
++
++    if (!mm_port_serial_at_command_finish (port, res, &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    g_task_return_pointer (task, ctx->parent_context, NULL);
++    g_object_unref (task);
++}
++
++static void
++parent_initialization_started_ready (MMBroadbandModem *self,
++                                     GAsyncResult     *res,
++                                     GTask            *task)
++{
++    InitializationContext *ctx;
++    GError                *error = NULL;
++
++    ctx                 = g_task_get_task_data (task);
++    ctx->parent_context = MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_asr_parent_class)->initialization_started_finish (self, res, &error);
++    if (error) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    mm_obj_dbg (self, "turning off autodial...");
++    mm_base_modem_at_command (MM_BASE_MODEM (self),
++                              "+DIALMODE=1",
++                              20,
++                              FALSE, /* allow cached */
++                              (GAsyncReadyCallback) dialmode_ready,
++                              task);
++}
++
++static void
++initialization_started (MMBroadbandModem    *self,
++                        GAsyncReadyCallback  callback,
++                        gpointer             user_data)
++{
++    InitializationContext *ctx;
++    GTask                 *task;
++
++    ctx = g_slice_new0 (InitializationContext);
++
++    task = g_task_new (self, NULL, callback, user_data);
++    g_task_set_task_data (task, ctx, (GDestroyNotify) initialization_context_free);
++
++    MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_asr_parent_class)->initialization_started (self, (GAsyncReadyCallback) parent_initialization_started_ready, task);
++}
++
++/*****************************************************************************/
++/* Load initial EPS bearer cid (Broadband modem class) */
++
++static gint
++load_initial_eps_bearer_cid_finish (MMBroadbandModem  *self,
++                                    GAsyncResult      *res,
++                                    GError           **error)
++{
++    return g_task_propagate_int (G_TASK (res), error);
++}
++
++static void
++load_initial_eps_bearer_cid (MMBroadbandModem    *self,
++                             GAsyncReadyCallback  callback,
++                             gpointer             user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    g_task_return_int (task, 1);
++    g_object_unref (task);
++}
++
++/*****************************************************************************/
++/* Setup ports (Broadband modem class) */
++
++static void
++set_ignored_unsolicited_events_handlers (MMBroadbandModemAsr *self)
++{
++    MMPortSerialAt *ports[2];
++    guint           i;
++
++    ports[0] = mm_base_modem_peek_port_primary (MM_BASE_MODEM (self));
++    ports[1] = mm_base_modem_peek_port_secondary (MM_BASE_MODEM (self));
++
++    for (i = 0; i < G_N_ELEMENTS (ports); i++) {
++        if (!ports[i])
++            continue;
++
++        mm_port_serial_at_add_unsolicited_msg_handler (ports[i],
++                                                       self->priv->connect_regex,
++                                                       NULL,
++                                                       NULL,
++                                                       NULL);
++    }
++}
++
++static void
++setup_ports (MMBroadbandModem *self)
++{
++    /* Call parent's setup ports first always */
++    MM_BROADBAND_MODEM_CLASS (mm_broadband_modem_asr_parent_class)->setup_ports (self);
++
++    /* Unsolicited messages to always ignore */
++    set_ignored_unsolicited_events_handlers (MM_BROADBAND_MODEM_ASR (self));
++}
++
++/*****************************************************************************/
++
++MMBroadbandModem *
++mm_broadband_modem_asr_new (const gchar  *device,
++                            const gchar  *physdev,
++                            const gchar **drivers,
++                            const gchar  *plugin,
++                            guint16       vendor_id,
++                            guint16       product_id)
++{
++    return MM_BROADBAND_MODEM (
++        g_object_new (MM_TYPE_BROADBAND_MODEM_ASR,
++                      MM_BASE_MODEM_DEVICE,             device,
++                      MM_BASE_MODEM_PHYSDEV,            physdev,
++                      MM_BASE_MODEM_DRIVERS,            drivers,
++                      MM_BASE_MODEM_PLUGIN,             plugin,
++                      MM_BASE_MODEM_VENDOR_ID,          vendor_id,
++                      MM_BASE_MODEM_PRODUCT_ID,         product_id,
++                      MM_BASE_MODEM_DATA_NET_SUPPORTED, TRUE,
++                      MM_BASE_MODEM_DATA_TTY_SUPPORTED, FALSE,
++                      NULL));
++}
++
++static void
++set_property (GObject      *object,
++              guint         prop_id,
++              const GValue *value,
++              GParamSpec   *pspec)
++{
++    MMBroadbandModemAsr *self = MM_BROADBAND_MODEM_ASR (object);
++
++    switch (prop_id) {
++    case PROP_DEFAULT_IP_METHOD:
++        self->priv->default_ip_method = g_value_get_enum (value);
++        break;
++    default:
++        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++        break;
++    }
++}
++
++static void
++get_property (GObject    *object,
++              guint       prop_id,
++              GValue     *value,
++              GParamSpec *pspec)
++{
++    MMBroadbandModemAsr *self = MM_BROADBAND_MODEM_ASR (object);
++
++    switch (prop_id) {
++    case PROP_DEFAULT_IP_METHOD:
++        g_value_set_enum (value, self->priv->default_ip_method);
++        break;
++    default:
++        G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++        break;
++    }
++}
++
++static void
++mm_broadband_modem_asr_init (MMBroadbandModemAsr *self)
++{
++    /* Initialize private data */
++    self->priv = G_TYPE_INSTANCE_GET_PRIVATE (self,
++                                              MM_TYPE_BROADBAND_MODEM_ASR,
++                                              MMBroadbandModemAsrPrivate);
++
++    self->priv->default_ip_method = MM_BEARER_IP_METHOD_DHCP;
++
++    self->priv->connect_regex = g_regex_new ("\\r\\nCONNECT.*\\r\\n", G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
++}
++
++static void
++finalize (GObject *object)
++{
++    MMBroadbandModemAsr *self = MM_BROADBAND_MODEM_ASR (object);
++
++    g_regex_unref (self->priv->connect_regex);
++
++    G_OBJECT_CLASS (mm_broadband_modem_asr_parent_class)->finalize (object);
++}
++
++static void
++iface_modem_init (MMIfaceModemInterface *iface)
++{
++    iface_modem_parent = g_type_interface_peek_parent (iface);
++
++    iface->create_bearer                    = modem_create_bearer;
++    iface->create_bearer_finish             = modem_create_bearer_finish;
++    iface->load_current_capabilities        = load_current_capabilities;
++    iface->load_current_capabilities_finish = load_current_capabilities_finish;
++    iface->modem_power_down                 = modem_power_down;
++    iface->modem_power_down_finish          = modem_power_down_finish;
++}
++
++static void
++iface_modem_3gpp_init (MMIfaceModem3gppInterface *iface)
++{
++    iface_modem_3gpp_parent = g_type_interface_peek_parent (iface);
++
++    iface->set_initial_eps_bearer_settings        = modem_3gpp_set_initial_eps_bearer_settings;
++    iface->set_initial_eps_bearer_settings_finish = modem_3gpp_set_initial_eps_bearer_settings_finish;
++}
++
++static void
++iface_modem_3gpp_profile_manager_init (MMIfaceModem3gppProfileManagerInterface *iface)
++{
++    iface_modem_3gpp_profile_manager_parent = g_type_interface_peek_parent (iface);
++
++    iface->check_format_finish = modem_3gpp_profile_manager_check_format_finish;
++}
++
++static void
++mm_broadband_modem_asr_class_init (MMBroadbandModemAsrClass *klass)
++{
++    GObjectClass          *object_class          = G_OBJECT_CLASS (klass);
++    MMBroadbandModemClass *broadband_modem_class = MM_BROADBAND_MODEM_CLASS (klass);
++
++    g_type_class_add_private (object_class, sizeof (MMBroadbandModemAsrPrivate));
++
++    object_class->get_property = get_property;
++    object_class->set_property = set_property;
++    object_class->finalize     = finalize;
++
++    broadband_modem_class->initialization_started             = initialization_started;
++    broadband_modem_class->initialization_started_finish      = initialization_started_finish;
++    broadband_modem_class->load_initial_eps_bearer_cid        = load_initial_eps_bearer_cid;
++    broadband_modem_class->load_initial_eps_bearer_cid_finish = load_initial_eps_bearer_cid_finish;
++    broadband_modem_class->setup_ports                        = setup_ports;
++
++    properties[PROP_DEFAULT_IP_METHOD] =
++        g_param_spec_enum (MM_BROADBAND_MODEM_ASR_DEFAULT_IP_METHOD,
++                           "Default IP method",
++                           "Default IP Method (static or DHCP) to use.",
++                           MM_TYPE_BEARER_IP_METHOD,
++                           MM_BEARER_IP_METHOD_DHCP,
++                           G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY);
++    g_object_class_install_property (object_class, PROP_DEFAULT_IP_METHOD, properties[PROP_DEFAULT_IP_METHOD]);
++}
+diff --git a/src/plugins/asr/mm-broadband-modem-asr.h b/src/plugins/asr/mm-broadband-modem-asr.h
+new file mode 100644
+index 00000000..dc996d58
+--- /dev/null
++++ b/src/plugins/asr/mm-broadband-modem-asr.h
+@@ -0,0 +1,40 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#ifndef MM_BROADBAND_MODEM_ASR_H
++#define MM_BROADBAND_MODEM_ASR_H
++
++#include "mm-broadband-modem.h"
++
++#define MM_TYPE_BROADBAND_MODEM_ASR (mm_broadband_modem_asr_get_type ())
++G_DECLARE_FINAL_TYPE (MMBroadbandModemAsr, mm_broadband_modem_asr, MM, BROADBAND_MODEM_ASR, MMBroadbandModem)
++
++#define MM_BROADBAND_MODEM_ASR_DEFAULT_IP_METHOD "broadband-modem-asr-default-ip-method"
++
++typedef struct _MMBroadbandModemAsrPrivate MMBroadbandModemAsrPrivate;
++
++struct _MMBroadbandModemAsr {
++    MMBroadbandModem            parent;
++    MMBroadbandModemAsrPrivate *priv;
++};
++
++MMBroadbandModem *mm_broadband_modem_asr_new (const gchar  *device,
++                                              const gchar  *physdev,
++                                              const gchar **drivers,
++                                              const gchar  *plugin,
++                                              guint16       vendor_id,
++                                              guint16       product_id);
++
++#endif /* MM_BROADBAND_MODEM_ASR_H */
+diff --git a/src/plugins/asr/mm-modem-helpers-asr.c b/src/plugins/asr/mm-modem-helpers-asr.c
+new file mode 100644
+index 00000000..943d8964
+--- /dev/null
++++ b/src/plugins/asr/mm-modem-helpers-asr.c
+@@ -0,0 +1,380 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#include <glib.h>
++#include <gio/gio.h>
++
++#include "mm-modem-helpers.h"
++#include "mm-modem-helpers-asr.h"
++
++/*****************************************************************************/
++/* +GETIP response parser */
++
++static gboolean
++assign_ipv4_or_ipv6 (const gchar  *address,
++                     gchar       **out_ipv4_address,
++                     gchar       **out_ipv6_address,
++                     GError      **error)
++{
++    g_autoptr(GInetAddress)   inet_address = NULL;
++    g_autofree gchar         *normalized_address = NULL;
++    gchar                   **out_address;
++
++    if (!mm_3gpp_normalize_address (address, &normalized_address, error))
++        return FALSE;
++
++    inet_address = g_inet_address_new_from_string (normalized_address);
++    if (!inet_address) {
++        g_set_error (error,
++                     MM_CORE_ERROR,
++                     MM_CORE_ERROR_FAILED,
++                     "Invalid IP address %s",
++                     address);
++        return FALSE;
++    }
++
++    switch (g_inet_address_get_family (inet_address)) {
++    case G_SOCKET_FAMILY_IPV4:
++        out_address = out_ipv4_address;
++        break;
++    case G_SOCKET_FAMILY_IPV6:
++        out_address = out_ipv6_address;
++        break;
++    case G_SOCKET_FAMILY_INVALID:
++    case G_SOCKET_FAMILY_UNIX:
++    default:
++        g_set_error (error,
++                     MM_CORE_ERROR,
++                     MM_CORE_ERROR_FAILED,
++                     "Invalid IP address %s",
++                     address);
++        return FALSE;
++    }
++
++    if (*out_address) {
++        g_set_error (error,
++                     MM_CORE_ERROR,
++                     MM_CORE_ERROR_FAILED,
++                     "IP address of this family has already been assigned");
++        return FALSE;
++    }
++    *out_address = g_steal_pointer (&normalized_address);
++
++    return TRUE;
++}
++
++gboolean
++mm_asr_parse_getip_response (const gchar  *response,
++                             gchar       **out_local_ipv4_address,
++                             gchar       **out_gateway_ipv4_address,
++                             gchar       **out_local_ipv6_address,
++                             gchar       **out_gateway_ipv6_address,
++                             gchar       **out_apn,
++                             GError      **error)
++{
++    g_autofree gchar *first_local_address    = NULL;
++    g_autofree gchar *first_gateway_address  = NULL;
++    g_autofree gchar *second_local_address   = NULL;
++    g_autofree gchar *second_gateway_address = NULL;
++    g_autofree gchar *local_ipv4_address     = NULL;
++    g_autofree gchar *gateway_ipv4_address   = NULL;
++    g_autofree gchar *local_ipv6_address     = NULL;
++    g_autofree gchar *gateway_ipv6_address   = NULL;
++    g_autofree gchar *apn                    = NULL;
++    GError           *inner_error            = NULL;
++    g_autoptr(GRegex) r                      = NULL;
++    g_autoptr(GMatchInfo) match_info         = NULL;
++
++    r = g_regex_new ("\\+GETIP:\\s*"
++                     "(\\d+)"             /* unknown */
++                     ",\\s*([^,]*)"       /* first local */
++                     ",\\s*([^,]*)"       /* first gateway */
++                     "(?:,\\s*([^,]*)"    /* second local */
++                     ",\\s*([^,]*))?"     /* second gateway */
++                     ",\\s*([^,\\r\\n]*)" /* apn */
++                     "(?:\\r\\n)?",
++                     0,
++                     0,
++                     NULL);
++    g_assert (r != NULL);
++
++    g_regex_match_full (r, response, strlen (response), 0, 0, &match_info, &inner_error);
++    if (inner_error) {
++        g_propagate_error (error, inner_error);
++        return FALSE;
++    }
++
++    if (!g_match_info_matches (match_info)) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_INVALID_ARGS, "Couldn't match +GETIP response");
++        return FALSE;
++    }
++
++    first_local_address = mm_get_string_unquoted_from_match_info (match_info, 2);
++    if (first_local_address && !assign_ipv4_or_ipv6 (first_local_address, &local_ipv4_address, &local_ipv6_address, error))
++        return FALSE;
++    first_gateway_address = mm_get_string_unquoted_from_match_info (match_info, 3);
++    if (first_gateway_address && !assign_ipv4_or_ipv6 (first_gateway_address, &gateway_ipv4_address, &gateway_ipv6_address, error))
++        return FALSE;
++
++    second_local_address = mm_get_string_unquoted_from_match_info (match_info, 4);
++    if (second_local_address && !assign_ipv4_or_ipv6 (second_local_address, &local_ipv4_address, &local_ipv6_address, error))
++        return FALSE;
++    second_gateway_address = mm_get_string_unquoted_from_match_info (match_info, 5);
++    if (second_gateway_address && !assign_ipv4_or_ipv6 (second_gateway_address, &gateway_ipv4_address, &gateway_ipv6_address, error))
++        return FALSE;
++
++    apn = mm_get_string_unquoted_from_match_info (match_info, 6);
++
++    if (out_local_ipv4_address)
++        *out_local_ipv4_address = g_steal_pointer (&local_ipv4_address);
++    if (out_gateway_ipv4_address)
++        *out_gateway_ipv4_address = g_steal_pointer (&gateway_ipv4_address);
++    if (out_local_ipv6_address)
++        *out_local_ipv6_address = g_steal_pointer (&local_ipv6_address);
++    if (out_gateway_ipv6_address)
++        *out_gateway_ipv6_address = g_steal_pointer (&gateway_ipv6_address);
++    if (out_apn)
++        *out_apn = g_steal_pointer (&apn);
++    return TRUE;
++}
++
++/*****************************************************************************/
++/* +CGCONTRDP response parser */
++
++gboolean
++mm_asr_parse_cgcontrdp_response_line (const gchar  *response,
++                                      guint        *out_cid,
++                                      guint        *out_bearer_id,
++                                      gchar       **out_apn,
++                                      gchar       **out_local_address,
++                                      gchar       **out_gateway_address,
++                                      gchar       **out_dns_primary_address,
++                                      gchar       **out_dns_secondary_address,
++                                      GError      **error)
++{
++    guint                  cid                      = 0;
++    guint                  bearer_id                = 0;
++    g_autofree gchar      *apn                      = NULL;
++    g_autofree gchar      *local_address            = NULL;
++    g_autofree gchar      *normalized_local_address = NULL;
++    g_autofree gchar      *gateway                  = NULL;
++    g_autofree gchar      *normalized_gateway       = NULL;
++    g_autofree gchar      *dns_primary              = NULL;
++    g_autofree gchar      *normalized_dns_primary   = NULL;
++    g_autofree gchar      *dns_secondary            = NULL;
++    g_autofree gchar      *normalized_dns_secondary = NULL;
++    GError                *inner_error              = NULL;
++    g_autoptr(GRegex)      r                        = NULL;
++    g_autoptr(GMatchInfo)  match_info               = NULL;
++
++    r = g_regex_new ("\\+CGCONTRDP:\\s*"
++                     "(\\d+),(\\d+),([^,]*)" /* cid, bearer id, apn */
++                     "(?:,([^,]*))?"         /* ip */
++                     "(?:,([^,]*))?"         /* gateway */
++                     "(?:,([^,]*))?"         /* dns1 */
++                     "(?:,([^,]*))?"         /* dns2 */
++                     "(?:,(.*))?"            /* others, ignored */
++                     "(?:\\r\\n)?",
++                     0,
++                     0,
++                     NULL);
++    g_assert (r != NULL);
++
++    g_regex_match_full (r, response, strlen (response), 0, 0, &match_info, &inner_error);
++    if (inner_error) {
++        g_propagate_error (error, inner_error);
++        return FALSE;
++    }
++
++    if (!g_match_info_matches (match_info)) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_INVALID_ARGS, "Couldn't match +CGCONTRDP response");
++        return FALSE;
++    }
++
++    if (!mm_get_uint_from_match_info (match_info, 1, &cid)) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED, "Error parsing cid");
++        return FALSE;
++    }
++
++    if (!mm_get_uint_from_match_info (match_info, 2, &bearer_id)) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED, "Error parsing bearer id");
++        return FALSE;
++    }
++
++    apn = mm_get_string_unquoted_from_match_info (match_info, 3);
++
++    local_address = mm_get_string_unquoted_from_match_info (match_info, 4);
++    if (local_address && !mm_3gpp_normalize_address (local_address, &normalized_local_address, error))
++        return FALSE;
++
++    gateway = mm_get_string_unquoted_from_match_info (match_info, 5);
++    if (gateway && !mm_3gpp_normalize_address (gateway, &normalized_gateway, error))
++        return FALSE;
++
++    dns_primary = mm_get_string_unquoted_from_match_info (match_info, 6);
++    if (dns_primary && !mm_3gpp_normalize_address (dns_primary, &normalized_dns_primary, error))
++        return FALSE;
++
++    dns_secondary = mm_get_string_unquoted_from_match_info (match_info, 7);
++    if (dns_secondary && !mm_3gpp_normalize_address (dns_secondary, &normalized_dns_secondary, error))
++        return FALSE;
++
++    if (out_cid)
++        *out_cid = cid;
++    if (out_bearer_id)
++        *out_bearer_id = bearer_id;
++    if (out_apn)
++        *out_apn = g_steal_pointer (&apn);
++    if (out_local_address)
++        *out_local_address = g_steal_pointer (&normalized_local_address);
++    if (out_gateway_address)
++        *out_gateway_address = g_steal_pointer (&normalized_gateway);
++    if (out_dns_primary_address)
++        *out_dns_primary_address = g_steal_pointer (&normalized_dns_primary);
++    if (out_dns_secondary_address)
++        *out_dns_secondary_address = g_steal_pointer (&normalized_dns_secondary);
++
++    return TRUE;
++}
++
++gboolean
++mm_asr_cgcontrdp_response_set_dns (const gchar       *response,
++                                   MMBearerIpConfig  *ipv4_config,
++                                   MMBearerIpConfig  *ipv6_config,
++                                   GError           **error)
++{
++    g_auto (GStrv) lines = NULL;
++    guint i;
++
++    lines = g_strsplit_set (response, "\r\n", -1);
++
++    for (i = 0; lines[i]; i++) {
++        MMBearerIpConfig        *ip_config     = NULL;
++        g_autoptr(GInetAddress)  inet_address  = NULL;
++        g_autofree gchar        *local_address = NULL;
++        g_auto (GStrv)           dns_addresses = NULL;
++        gchar                   *line          = lines[i];
++
++        /* skip lines with whitespace only */
++        g_strstrip (line);
++        if (!line[0])
++            continue;
++
++        dns_addresses = g_new0 (gchar *, 3);
++
++        if (!mm_asr_parse_cgcontrdp_response_line (lines[i],
++                                                   NULL, /* cid */
++                                                   NULL, /* bearer_id */
++                                                   NULL, /* apn */
++                                                   &local_address,
++                                                   NULL, /* gateway */
++                                                   &dns_addresses[0],
++                                                   &dns_addresses[1],
++                                                   error)) {
++            return FALSE;
++        }
++
++        inet_address = g_inet_address_new_from_string (local_address);
++        if (!inet_address) {
++            g_set_error (error,
++                         MM_CORE_ERROR,
++                         MM_CORE_ERROR_FAILED,
++                         "Invalid IP address %s",
++                         local_address);
++            return FALSE;
++        }
++
++        switch (g_inet_address_get_family (inet_address)) {
++        case G_SOCKET_FAMILY_IPV4:
++            ip_config = ipv4_config;
++            break;
++        case G_SOCKET_FAMILY_IPV6:
++            ip_config = ipv6_config;
++            break;
++        case G_SOCKET_FAMILY_INVALID:
++        case G_SOCKET_FAMILY_UNIX:
++        default:
++            g_set_error (error,
++                         MM_CORE_ERROR,
++                         MM_CORE_ERROR_FAILED,
++                         "Invalid IP address %s",
++                         local_address);
++            return FALSE;
++        }
++
++        if (!ip_config)
++            /* This IP family was not requested so just ignore it */
++            continue;
++
++        if (mm_bearer_ip_config_get_dns (ip_config)) {
++            g_set_error (error,
++                         MM_CORE_ERROR,
++                         MM_CORE_ERROR_FAILED,
++                         "Received multiple DNS responses of the same IP family");
++            return FALSE;
++        }
++
++        mm_bearer_ip_config_set_dns (ip_config, (const gchar **) dns_addresses);
++    }
++
++    return TRUE;
++}
++
++/*****************************************************************************/
++/* *AUTHREQ set command helper */
++
++gboolean
++mm_asr_build_authreq_command (guint                cid,
++                              MMBearerProperties  *properties,
++                              gchar              **out_cmd,
++                              GError             **error)
++{
++    MMBearerAllowedAuth  allowed_auth;
++    const gchar         *user;
++    const gchar         *password;
++    guint                auth_type;
++    g_autofree gchar    *quoted_user     = NULL;
++    g_autofree gchar    *quoted_password = NULL;
++
++    allowed_auth = mm_bearer_properties_get_allowed_auth (properties);
++    user         = mm_bearer_properties_get_user (properties);
++    password     = mm_bearer_properties_get_password (properties);
++
++    if (allowed_auth == MM_BEARER_ALLOWED_AUTH_UNKNOWN) {
++        /* Default to CHAP auth */
++        auth_type = 2;
++    } else if (allowed_auth == MM_BEARER_ALLOWED_AUTH_NONE) {
++        auth_type = 0;
++    } else if (allowed_auth & MM_BEARER_ALLOWED_AUTH_PAP) {
++        auth_type = 1;
++    } else if (allowed_auth & MM_BEARER_ALLOWED_AUTH_CHAP) {
++        auth_type = 2;
++    } else {
++        g_autofree gchar *auth_str = NULL;
++
++        auth_str = mm_bearer_allowed_auth_build_string_from_mask (allowed_auth);
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED, "Cannot use any of the specified authentication methods (%s)", auth_str);
++        return FALSE;
++    }
++
++    quoted_user     = mm_at_quote_string (user);
++    quoted_password = mm_at_quote_string (password);
++    *out_cmd        = g_strdup_printf ("*AUTHREQ=%u,%u,%s,%s",
++                                cid,
++                                auth_type,
++                                quoted_user,
++                                quoted_password);
++    return TRUE;
++}
+diff --git a/src/plugins/asr/mm-modem-helpers-asr.h b/src/plugins/asr/mm-modem-helpers-asr.h
+new file mode 100644
+index 00000000..b4280177
+--- /dev/null
++++ b/src/plugins/asr/mm-modem-helpers-asr.h
+@@ -0,0 +1,60 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#ifndef MM_MODEM_HELPERS_ASR_H
++#define MM_MODEM_HELPERS_ASR_H
++
++#include <glib.h>
++
++#include <ModemManager.h>
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++/*****************************************************************************/
++/* +GETIP response parser */
++
++gboolean mm_asr_parse_getip_response (const gchar  *response,
++                                      gchar       **out_local_ipv4_address,
++                                      gchar       **out_gateway_ipv4_address,
++                                      gchar       **out_local_ipv6_address,
++                                      gchar       **out_gateway_ipv6_address,
++                                      gchar       **out_apn,
++                                      GError      **error);
++
++/*****************************************************************************/
++/* +CGCONTRDP response parser */
++
++gboolean mm_asr_parse_cgcontrdp_response_line (const gchar  *response,
++                                               guint        *out_cid,
++                                               guint        *out_bearer_id,
++                                               gchar       **out_apn,
++                                               gchar       **out_local_address,
++                                               gchar       **out_gateway_address,
++                                               gchar       **out_dns_primary_address,
++                                               gchar       **out_dns_secondary_address,
++                                               GError      **error);
++
++gboolean mm_asr_cgcontrdp_response_set_dns (const gchar       *response,
++                                            MMBearerIpConfig  *ipv4_config,
++                                            MMBearerIpConfig  *ipv6_config,
++                                            GError           **error);
++
++/* *AUTHREQ set command helper */
++gboolean mm_asr_build_authreq_command (guint                cid,
++                                       MMBearerProperties  *properties,
++                                       gchar              **out_cmd,
++                                       GError             **error);
++
++#endif /* MM_MODEM_HELPERS_ASR_H */
+diff --git a/src/plugins/asr/tests/test-modem-helpers-asr.c b/src/plugins/asr/tests/test-modem-helpers-asr.c
+new file mode 100644
+index 00000000..5c91c39c
+--- /dev/null
++++ b/src/plugins/asr/tests/test-modem-helpers-asr.c
+@@ -0,0 +1,385 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#include <glib.h>
++#include <glib-object.h>
++#include <locale.h>
++
++#include <ModemManager.h>
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-modem-helpers-asr.h"
++
++/*****************************************************************************/
++/* Test +GETIP responses */
++
++typedef struct {
++    const gchar *str;
++    gboolean     success;
++    gint         error_code;
++    const gchar *local_ipv4_address;
++    const gchar *gateway_ipv4_address;
++    const gchar *local_ipv6_address;
++    const gchar *gateway_ipv6_address;
++    const gchar *apn;
++} GetIpResponseTest;
++
++static const GetIpResponseTest getip_response_tests[] = {
++    /* IPv4 only */
++    {
++        .str                  = "+GETIP: 1, 10.84.204.114, 10.84.204.21, iotsim.melita.io.mnc077.mcc278.gprs\r\n",
++        .success              = TRUE,
++        .local_ipv4_address   = "10.84.204.114",
++        .gateway_ipv4_address = "10.84.204.21",
++        .local_ipv6_address   = NULL,
++        .gateway_ipv6_address = NULL,
++        .apn                  = "iotsim.melita.io.mnc077.mcc278.gprs",
++    },
++    /* IPv4 and IPv6 */
++    {
++        .str                  = "+GETIP: 3, 10.219.101.221, 10.219.101.34, 254.128.0.0.0.0.0.0.210.0.31.251.144.160.50.11, 0.0.0.0.0.0.0.0.210.0.31.251.144.160.50.244, internet.telekom.mnc001.mcc262.gprs",
++        .success              = TRUE,
++        .local_ipv4_address   = "10.219.101.221",
++        .gateway_ipv4_address = "10.219.101.34",
++        .local_ipv6_address   = "fe80::d200:1ffb:90a0:320b",
++        .gateway_ipv6_address = "::d200:1ffb:90a0:32f4",
++        .apn                  = "internet.telekom.mnc001.mcc262.gprs",
++    },
++    /* IPv6 only */
++    {
++        .str                  = "+GETIP: 3, 254.128.0.0.0.0.0.0.210.0.31.251.144.160.50.11, 0.0.0.0.0.0.0.0.210.0.31.251.144.160.50.244, internet.telekom.mnc001.mcc262.gprs\r\n",
++        .success              = TRUE,
++        .local_ipv4_address   = NULL,
++        .gateway_ipv4_address = NULL,
++        .local_ipv6_address   = "fe80::d200:1ffb:90a0:320b",
++        .gateway_ipv6_address = "::d200:1ffb:90a0:32f4",
++        .apn                  = "internet.telekom.mnc001.mcc262.gprs",
++    },
++    /* Empty IPv4 and IPv6 */
++    {
++        .str                  = "+GETIP: 3, , , 254.128.0.0.0.0.0.0.210.0.31.251.144.160.50.11, 0.0.0.0.0.0.0.0.210.0.31.251.144.160.50.244, internet.telekom.mnc001.mcc262.gprs",
++        .success              = TRUE,
++        .local_ipv4_address   = NULL,
++        .gateway_ipv4_address = NULL,
++        .local_ipv6_address   = "fe80::d200:1ffb:90a0:320b",
++        .gateway_ipv6_address = "::d200:1ffb:90a0:32f4",
++        .apn                  = "internet.telekom.mnc001.mcc262.gprs",
++    },
++    /* IPv4 and empty IPv6 */
++    {
++        .str                  = "+GETIP: 3, 10.219.101.221, 10.219.101.34, , , internet.telekom.mnc001.mcc262.gprs",
++        .success              = TRUE,
++        .local_ipv4_address   = "10.219.101.221",
++        .gateway_ipv4_address = "10.219.101.34",
++        .local_ipv6_address   = NULL,
++        .gateway_ipv6_address = NULL,
++        .apn                  = "internet.telekom.mnc001.mcc262.gprs",
++    },
++    /* Two IPv4 */
++    {
++        .str        = "+GETIP: 3, 10.219.101.221, 10.219.101.34, 10.219.101.221, 10.219.101.34, internet.telekom.mnc001.mcc262.gprs\r\n",
++        .success    = FALSE,
++        .error_code = MM_CORE_ERROR_FAILED,
++    },
++    /* Two IPv6 */
++    {
++        .str        = "+GETIP: 3, 254.128.0.0.0.0.0.0.210.0.31.251.144.160.50.11, 0.0.0.0.0.0.0.0.210.0.31.251.144.160.50.244, 254.128.0.0.0.0.0.0.210.0.31.251.144.160.50.11, 0.0.0.0.0.0.0.0.210.0.31.251.144.160.50.244, internet.telekom.mnc001.mcc262.gprs\r\n",
++        .success    = FALSE,
++        .error_code = MM_CORE_ERROR_FAILED,
++    }
++};
++
++static void
++test_getip (void)
++{
++    guint i;
++
++    for (i = 0; i < G_N_ELEMENTS (getip_response_tests); i++) {
++        gboolean          success;
++        GError           *error                = NULL;
++        g_autofree gchar *local_ipv4_address   = NULL;
++        g_autofree gchar *gateway_ipv4_address = NULL;
++        g_autofree gchar *local_ipv6_address   = NULL;
++        g_autofree gchar *gateway_ipv6_address = NULL;
++        g_autofree gchar *apn                  = NULL;
++
++        success = mm_asr_parse_getip_response (getip_response_tests[i].str,
++                                               &local_ipv4_address,
++                                               &gateway_ipv4_address,
++                                               &local_ipv6_address,
++                                               &gateway_ipv6_address,
++                                               &apn,
++                                               &error);
++        if (getip_response_tests[i].success) {
++            g_assert_no_error (error);
++            g_assert (success);
++        } else {
++            g_assert_error (error, MM_CORE_ERROR, getip_response_tests[i].error_code);
++            g_assert (!success);
++        }
++
++        g_assert_cmpstr (getip_response_tests[i].local_ipv4_address, ==, local_ipv4_address);
++        g_assert_cmpstr (getip_response_tests[i].gateway_ipv4_address, ==, gateway_ipv4_address);
++        g_assert_cmpstr (getip_response_tests[i].local_ipv6_address, ==, local_ipv6_address);
++        g_assert_cmpstr (getip_response_tests[i].gateway_ipv6_address, ==, gateway_ipv6_address);
++        g_assert_cmpstr (getip_response_tests[i].apn, ==, apn);
++    }
++}
++
++/*****************************************************************************/
++/* Test +CGCONTRDP responses */
++
++typedef struct {
++    const gchar *line;
++    guint        cid;
++    guint        bearer_id;
++    const gchar *apn;
++    const gchar *local_address;
++    const gchar *gateway;
++    const gchar *dns_primary_address;
++    const gchar *dns_secondary_address;
++} CgcontrdpResponseLineTest;
++
++static const CgcontrdpResponseLineTest cgcontrdp_response_line_tests[] = {
++    /* IPv4 */
++    {
++        .line                  = "+CGCONTRDP: 3,5,\"iotsim.melita.io\",\"10.84.204.114\",\"\",\"212.56.132.20\",\"212.56.129.228\",\"\",\"\",0,0\r\n",
++        .cid                   = 3,
++        .bearer_id             = 5,
++        .apn                   = "iotsim.melita.io",
++        .local_address         = "10.84.204.114",
++        .gateway               = NULL,
++        .dns_primary_address   = "212.56.132.20",
++        .dns_secondary_address = "212.56.129.228",
++    },
++    /* IPv6 */
++    {
++        .line                  = "+CGCONTRDP:\t4,7,\"internet.telekom\",\"42.1.5.153.9.64.16.204.210.0.31.251.144.160.50.11\",\"\",\"42.1.5.152.7.255.0.0.0.16.0.116.2.16.2.16\",\"42.1.5.152.7.255.0.0.0.16.0.116.2.16.2.17\",\"\",\"\",0,0",
++        .cid                   = 4,
++        .bearer_id             = 7,
++        .apn                   = "internet.telekom",
++        .local_address         = "2a01:599:940:10cc:d200:1ffb:90a0:320b",
++        .gateway               = NULL,
++        .dns_primary_address   = "2a01:598:7ff:0:10:74:210:210",
++        .dns_secondary_address = "2a01:598:7ff:0:10:74:210:211",
++    },
++};
++
++static void
++test_cgcontrdp_line (void)
++{
++    guint i;
++
++    for (i = 0; i < G_N_ELEMENTS (cgcontrdp_response_line_tests); i++) {
++        gboolean          success;
++        GError           *error                 = NULL;
++        guint             cid                   = G_MAXUINT;
++        guint             bearer_id             = G_MAXUINT;
++        g_autofree gchar *apn                   = NULL;
++        g_autofree gchar *local_address         = NULL;
++        g_autofree gchar *gateway               = NULL;
++        g_autofree gchar *dns_primary_address   = NULL;
++        g_autofree gchar *dns_secondary_address = NULL;
++
++        success = mm_asr_parse_cgcontrdp_response_line (cgcontrdp_response_line_tests[i].line,
++                                                        &cid,
++                                                        &bearer_id,
++                                                        &apn,
++                                                        &local_address,
++                                                        &gateway,
++                                                        &dns_primary_address,
++                                                        &dns_secondary_address,
++                                                        &error);
++        g_assert_no_error (error);
++        g_assert (success);
++        g_assert_cmpuint (cgcontrdp_response_line_tests[i].cid, ==, cid);
++        g_assert_cmpuint (cgcontrdp_response_line_tests[i].bearer_id, ==, bearer_id);
++        g_assert_cmpstr (cgcontrdp_response_line_tests[i].apn, ==, apn);
++        g_assert_cmpstr (cgcontrdp_response_line_tests[i].local_address, ==, local_address);
++        g_assert_cmpstr (cgcontrdp_response_line_tests[i].gateway, ==, gateway);
++        g_assert_cmpstr (cgcontrdp_response_line_tests[i].dns_primary_address, ==, dns_primary_address);
++        g_assert_cmpstr (cgcontrdp_response_line_tests[i].dns_secondary_address, ==, dns_secondary_address);
++    }
++}
++
++typedef struct {
++    const gchar *str;
++    gboolean     has_ipv4;
++    const gchar *ipv4_dns1;
++    const gchar *ipv4_dns2;
++    gboolean     has_ipv6;
++    const gchar *ipv6_dns1;
++    const gchar *ipv6_dns2;
++} CgcontrdpDnsTest;
++
++static const CgcontrdpDnsTest cgcontrdp_dns_tests[] = {
++    /* IPv4 only */
++    {
++        .str       = "+CGCONTRDP: 3,5,\"iotsim.melita.io\",\"10.84.204.114\",\"\",\"212.56.132.20\",\"212.56.129.228\",\"\",\"\",0,0\r\n",
++        .has_ipv4  = TRUE,
++        .ipv4_dns1 = "212.56.132.20",
++        .ipv4_dns2 = "212.56.129.228",
++        .has_ipv6  = FALSE,
++    },
++    /* IPv6 only */
++    {
++        .str       = "+CGCONTRDP: 4,7,\"internet.telekom\",\"42.1.5.153.9.64.16.204.210.0.31.251.144.160.50.11\",\"\",\"42.1.5.152.7.255.0.0.0.16.0.116.2.16.2.16\",\"42.1.5.152.7.255.0.0.0.16.0.116.2.16.2.17\",\"\",\"\",0,0\r\n",
++        .has_ipv4  = FALSE,
++        .has_ipv6  = TRUE,
++        .ipv6_dns1 = "2a01:598:7ff:0:10:74:210:210",
++        .ipv6_dns2 = "2a01:598:7ff:0:10:74:210:211",
++    },
++    /* IPv4 and IPv6 */
++    {
++        .str       = "+CGCONTRDP: 4,7,\"internet.telekom\",\"10.219.101.221\",\"\",\"10.74.210.210\",\"10.74.210.211\",\"\",\"\",0,0\r\n\n\n+CGCONTRDP: 4,7,\"internet.telekom\",\"42.1.5.153.9.64.16.204.210.0.31.251.144.160.50.11\",\"\",\"42.1.5.152.7.255.0.0.0.16.0.116.2.16.2.16\",\"42.1.5.152.7.255.0.0.0.16.0.116.2.16.2.17\",\"\",\"\",0,0\r\n",
++        .has_ipv4  = TRUE,
++        .ipv4_dns1 = "10.74.210.210",
++        .ipv4_dns2 = "10.74.210.211",
++        .has_ipv6  = TRUE,
++        .ipv6_dns1 = "2a01:598:7ff:0:10:74:210:210",
++        .ipv6_dns2 = "2a01:598:7ff:0:10:74:210:211",
++    },
++};
++
++static void
++test_cgcontrdp (void)
++{
++    guint i;
++
++    for (i = 0; i < G_N_ELEMENTS (cgcontrdp_dns_tests); i++) {
++        gboolean                     success;
++        GError                      *error       = NULL;
++        g_autoptr(MMBearerIpConfig)  ipv4_config = NULL;
++        g_autoptr(MMBearerIpConfig)  ipv6_config = NULL;
++
++        if (cgcontrdp_dns_tests[i].has_ipv4)
++            ipv4_config = mm_bearer_ip_config_new ();
++        if (cgcontrdp_dns_tests[i].has_ipv6)
++            ipv6_config = mm_bearer_ip_config_new ();
++
++        success = mm_asr_cgcontrdp_response_set_dns (cgcontrdp_dns_tests[i].str,
++                                                     ipv4_config,
++                                                     ipv6_config,
++                                                     &error);
++        g_assert_no_error (error);
++        g_assert (success);
++        if (cgcontrdp_dns_tests[i].has_ipv4) {
++            g_assert_cmpstr (cgcontrdp_dns_tests[i].ipv4_dns1, ==, mm_bearer_ip_config_get_dns (ipv4_config)[0]);
++            g_assert_cmpstr (cgcontrdp_dns_tests[i].ipv4_dns2, ==, mm_bearer_ip_config_get_dns (ipv4_config)[1]);
++        }
++        if (cgcontrdp_dns_tests[i].has_ipv6) {
++            g_assert_cmpstr (cgcontrdp_dns_tests[i].ipv6_dns1, ==, mm_bearer_ip_config_get_dns (ipv6_config)[0]);
++            g_assert_cmpstr (cgcontrdp_dns_tests[i].ipv6_dns2, ==, mm_bearer_ip_config_get_dns (ipv6_config)[1]);
++        }
++    }
++}
++
++/*****************************************************************************/
++/* Test *AUTHREQ command builder */
++
++typedef struct {
++    guint                cid;
++    MMBearerAllowedAuth  allowed_auth;
++    const gchar         *user;
++    const gchar         *password;
++    const gchar         *cmd;
++} AuthReqCommandTest;
++
++static const AuthReqCommandTest authreq_command_tests[] = {
++    {
++        .cid          = 1,
++        .allowed_auth = MM_BEARER_ALLOWED_AUTH_UNKNOWN,
++        .cmd          = "*AUTHREQ=1,2,\"\",\"\"",
++    },
++    {
++        .cid          = 2,
++        .allowed_auth = MM_BEARER_ALLOWED_AUTH_UNKNOWN,
++        .user         = "user",
++        .password     = "password",
++        .cmd          = "*AUTHREQ=2,2,\"user\",\"password\"",
++    },
++    {
++        .cid          = 3,
++        .allowed_auth = MM_BEARER_ALLOWED_AUTH_NONE,
++        .user         = "user",
++        .cmd          = "*AUTHREQ=3,0,\"user\",\"\"",
++    },
++    {
++        .cid          = 1,
++        .allowed_auth = MM_BEARER_ALLOWED_AUTH_PAP,
++        .user         = "user",
++        .password     = "password",
++        .cmd          = "*AUTHREQ=1,1,\"user\",\"password\"",
++    },
++    {
++        .cid          = 1,
++        .allowed_auth = MM_BEARER_ALLOWED_AUTH_CHAP,
++        .user         = "user",
++        .password     = "password",
++        .cmd          = "*AUTHREQ=1,2,\"user\",\"password\"",
++    },
++    {
++        .cid          = 1,
++        .allowed_auth = MM_BEARER_ALLOWED_AUTH_PAP | MM_BEARER_ALLOWED_AUTH_CHAP,
++        .user         = "user",
++        .password     = "password",
++        .cmd          = "*AUTHREQ=1,1,\"user\",\"password\"",
++    }
++};
++
++static void
++test_authreq (void)
++{
++    guint i;
++
++    for (i = 0; i < G_N_ELEMENTS (authreq_command_tests); i++) {
++        gboolean success;
++        g_autoptr(MMBearerProperties) properties = NULL;
++        g_autofree gchar *cmd                    = NULL;
++        GError           *error                  = NULL;
++
++        properties = mm_bearer_properties_new ();
++        mm_bearer_properties_set_allowed_auth (properties, authreq_command_tests[i].allowed_auth);
++
++        if (authreq_command_tests[i].user)
++            mm_bearer_properties_set_user (properties, authreq_command_tests[i].user);
++        if (authreq_command_tests[i].password)
++            mm_bearer_properties_set_password (properties, authreq_command_tests[i].password);
++
++        success = mm_asr_build_authreq_command (authreq_command_tests[i].cid, properties, &cmd, &error);
++
++        g_assert_no_error (error);
++        g_assert (success);
++        g_assert_cmpstr (cmd, ==, authreq_command_tests[i].cmd);
++    }
++}
++
++/*****************************************************************************/
++
++int
++main (int argc, char **argv)
++{
++    setlocale (LC_ALL, "");
++
++    g_test_init (&argc, &argv, NULL);
++
++    g_test_add_func ("/MM/asr/getip", test_getip);
++    g_test_add_func ("/MM/asr/cgcontrdp_line", test_cgcontrdp_line);
++    g_test_add_func ("/MM/asr/cgcontrdp", test_cgcontrdp);
++    g_test_add_func ("/MM/asr/authreq", test_authreq);
++
++    return g_test_run ();
++}
+diff --git a/src/plugins/meson.build b/src/plugins/meson.build
+index b21b5e36..fd4abfc4 100644
+--- a/src/plugins/meson.build
++++ b/src/plugins/meson.build
+@@ -66,6 +66,24 @@ if enable_qmi
+   plugins_deps += qmi_glib_dep
+ endif
+ 
++# common asr support library
++if plugins_shared['asr']
++  asr_inc = include_directories('asr')
++
++  common_c_args = '-DMM_MODULE_NAME="shared-asr"'
++
++  sources = files(
++    'asr/mm-broadband-bearer-asr.c',
++    'asr/mm-broadband-modem-asr.c',
++  )
++  plugins += {'shared-asr': {
++    'plugin': false,
++    'helper': {'sources': files('asr/mm-modem-helpers-asr.c'), 'include_directories': plugins_incs + [asr_inc], 'c_args': common_c_args},
++    'module': {'sources': sources, 'include_directories': plugins_incs + [asr_inc], 'c_args': common_c_args},
++    'test': {'sources': files('asr/tests/test-modem-helpers-asr.c'), 'include_directories': asr_inc, 'dependencies': libhelpers_dep},
++  }}
++endif
++
+ # common Fibocom support library
+ if plugins_shared['fibocom']
+   fibocom_inc = include_directories('fibocom')

@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsOS build <build@localhost>
+Date: Wed, 7 Oct 2026 11:55:54 +0200
+Subject: [PATCH 6/6] meig: support the SLM770A in RNDIS mode (2dee:4d57)
+
+The Teltonika TRM200 ships the SLM770A in RNDIS mode (AT+SER=3), which
+enumerates as 2dee:4d57 with the same port layout as the ECM variant.
+---
+ src/plugins/meig/77-mm-meig-port-types.rules | 10 ++++++++++
+ src/plugins/meig/mm-plugin-meig-asr.c        |  3 ++-
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/src/plugins/meig/77-mm-meig-port-types.rules b/src/plugins/meig/77-mm-meig-port-types.rules
+index f32dfa41..1e63c396 100644
+--- a/src/plugins/meig/77-mm-meig-port-types.rules
++++ b/src/plugins/meig/77-mm-meig-port-types.rules
+@@ -7,6 +7,16 @@ GOTO="mm_meig_end"
+ LABEL="mm_meig_start"
+ SUBSYSTEMS=="usb", ATTRS{bInterfaceNumber}=="?*", ENV{.MM_USBIFNUM}="$attr{bInterfaceNumber}"
+ 
++# MeiG SLM770A (RNDIS), e.g. Teltonika TRM200
++#  ttyUSB0 (if #2): ASR DIAG port (ignore for now)
++#  ttyUSB1 (if #3): AT port
++#  ttyUSB2 (if #4): AT port
++#  ttyUSB3 (if #5): GPS data port
++ATTRS{idVendor}=="2dee", ATTRS{idProduct}=="4d57", ENV{.MM_USBIFNUM}=="02", SUBSYSTEM=="tty", ENV{ID_MM_PORT_IGNORE}="1"
++ATTRS{idVendor}=="2dee", ATTRS{idProduct}=="4d57", ENV{.MM_USBIFNUM}=="03", SUBSYSTEM=="tty", ENV{ID_MM_PORT_TYPE_AT_PRIMARY}="1"
++ATTRS{idVendor}=="2dee", ATTRS{idProduct}=="4d57", ENV{.MM_USBIFNUM}=="04", SUBSYSTEM=="tty", ENV{ID_MM_PORT_TYPE_AT_SECONDARY}="1"
++ATTRS{idVendor}=="2dee", ATTRS{idProduct}=="4d57", ENV{.MM_USBIFNUM}=="05", SUBSYSTEM=="tty", ENV{ID_MM_PORT_GPS}="1"
++
+ # MeiG SLM770A (ECM)
+ #  ttyUSB0 (if #2): ASR DIAG port (ignore for now)
+ #  ttyUSB1 (if #3): AT port
+diff --git a/src/plugins/meig/mm-plugin-meig-asr.c b/src/plugins/meig/mm-plugin-meig-asr.c
+index 70c3e45d..657a4a4f 100644
+--- a/src/plugins/meig/mm-plugin-meig-asr.c
++++ b/src/plugins/meig/mm-plugin-meig-asr.c
+@@ -53,7 +53,8 @@ mm_plugin_create_meig_asr (void)
+ {
+     static const gchar          *subsystems[] = { "tty", "net", NULL };
+     static const mm_uint16_pair  products[]   = {
+-        { 0x2dee, 0x4d58 }, /* MeiG SLM770A */
++        { 0x2dee, 0x4d57 }, /* MeiG SLM770A (RNDIS), e.g. Teltonika TRM200 */
++        { 0x2dee, 0x4d58 }, /* MeiG SLM770A (ECM) */
+         { 0, 0 }
+     };
+ 

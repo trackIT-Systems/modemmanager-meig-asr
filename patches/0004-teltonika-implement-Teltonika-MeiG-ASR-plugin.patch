@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lukas Voegl <lvoegl@tdt.de>
+Date: Thu, 17 Sep 2026 11:28:09 +0200
+Subject: [PATCH 4/6] teltonika: implement Teltonika MeiG ASR plugin
+
+Implements a plugin for MeiG-ASR based Teltonika modems using shared MeiG utilities.
+
+Signed-off-by: Lukas Voegl <lvoegl@tdt.de>
+---
+ meson.build                                   |  1 +
+ meson_options.txt                             |  1 +
+ src/plugins/README.txt                        |  3 +
+ src/plugins/meson.build                       | 18 +++++
+ src/plugins/mm-builtin-plugins.c              |  6 ++
+ .../77-mm-teltonika-port-types.rules          | 20 +++++
+ .../teltonika/mm-plugin-teltonika-meig-asr.c  | 79 +++++++++++++++++++
+ src/plugins/tests/test-udev-rules.c           | 11 +++
+ 8 files changed, 139 insertions(+)
+ create mode 100644 src/plugins/teltonika/77-mm-teltonika-port-types.rules
+ create mode 100644 src/plugins/teltonika/mm-plugin-teltonika-meig-asr.c
+
+diff --git a/meson.build b/meson.build
+index 59dd9bf5..7894c980 100644
+--- a/meson.build
++++ b/meson.build
+@@ -365,6 +365,7 @@ plugins_options_reqs = {
+   'sierra': {'available': true, 'shared': ['xmm']},
+   'simtech': {'available': true, 'shared': []},
+   'telit': {'available': true, 'shared': ['telit']},
++  'teltonika-meig-asr': {'available': true, 'shared': ['meig', 'asr']},
+   'thuraya': {'available': true, 'shared': []},
+   'tplink': {'available': true, 'shared': []},
+   'ublox': {'available': true, 'shared': []},
+diff --git a/meson_options.txt b/meson_options.txt
+index 9bf7f344..205ecca1 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -64,6 +64,7 @@ option('plugin_sierra_legacy', type: 'feature', value: 'auto', description: 'ena
+ option('plugin_sierra', type: 'feature', value: 'auto', description: 'enable sierra plugin support')
+ option('plugin_simtech', type: 'feature', value: 'auto', description: 'enable simtech plugin support')
+ option('plugin_telit', type: 'feature', value: 'auto', description: 'enable telit plugin support')
++option('plugin_teltonika_meig_asr', type: 'feature', value: 'auto', description: 'enable teltonika meig asr plugin support')
+ option('plugin_thuraya', type: 'feature', value: 'auto', description: 'enable thuraya plugin support')
+ option('plugin_tplink', type: 'feature', value: 'auto', description: 'enable tplink plugin support')
+ option('plugin_ublox', type: 'feature', value: 'auto', description: 'enable ublox plugin support')
+diff --git a/src/plugins/README.txt b/src/plugins/README.txt
+index fc9a633e..6f682021 100644
+--- a/src/plugins/README.txt
++++ b/src/plugins/README.txt
+@@ -137,6 +137,9 @@ objects created by the plugin is given.
+    ** MMBroadbandModemMbimTelit
+    ** MMBroadbandModemTelit
+ 
++ * Teltonika MeiG ASR:
++   ** MMBroadbandModemTeltonikaMeigAsr (subclassed from the MeiG ASR utils)
++
+  * Thuraya
+    ** MMBroadbandModemThuraya
+ 
+diff --git a/src/plugins/meson.build b/src/plugins/meson.build
+index 8248eea0..00b51829 100644
+--- a/src/plugins/meson.build
++++ b/src/plugins/meson.build
+@@ -1004,6 +1004,24 @@ if plugins_options['telit']
+   plugins_udev_rules += files('telit/77-mm-telit-port-types.rules')
+ endif
+ 
++# plugin: teltonika (meig, asr)
++if plugins_options['teltonika-meig-asr']
++  test_udev_rules_dir_c_args = ['-DTESTUDEVRULESDIR_TELTONIKA_MEIG_ASR="@0@"'.format(plugins_dir / 'teltonika')]
++  plugins_test_udev_rules_dir_c_args += test_udev_rules_dir_c_args
++
++  sources = files(
++    'teltonika/mm-plugin-teltonika-meig-asr.c',
++  )
++  incs = plugins_incs + [meig_inc] + [asr_inc]
++
++  plugins += {'plugin-teltonika-meig-asr': {
++    'plugin': true,
++    'module': {'sources': sources, 'include_directories': incs, 'c_args': test_udev_rules_dir_c_args + ['-DMM_MODULE_NAME="teltonika-meig-asr"']},
++  }}
++
++  plugins_udev_rules += files('teltonika/77-mm-teltonika-port-types.rules')
++endif
++
+ # plugin: thuraya xt
+ if plugins_options['thuraya']
+   common_c_args = ['-DMM_MODULE_NAME="thuraya"']
+diff --git a/src/plugins/mm-builtin-plugins.c b/src/plugins/mm-builtin-plugins.c
+index ee555c31..d3890058 100644
+--- a/src/plugins/mm-builtin-plugins.c
++++ b/src/plugins/mm-builtin-plugins.c
+@@ -127,6 +127,9 @@ MMPlugin *mm_plugin_create_simtech (void);
+ #if defined ENABLE_PLUGIN_TELIT
+ MMPlugin *mm_plugin_create_telit (void);
+ #endif
++#if defined ENABLE_PLUGIN_TELTONIKA_MEIG_ASR
++MMPlugin *mm_plugin_create_teltonika_meig_asr (void);
++#endif
+ #if defined ENABLE_PLUGIN_THURAYA
+ MMPlugin *mm_plugin_create_thuraya (void);
+ #endif
+@@ -268,6 +271,9 @@ mm_builtin_plugins_load (void)
+ #if defined ENABLE_PLUGIN_TELIT
+     PREPEND_PLUGIN (telit);
+ #endif
++#if defined ENABLE_PLUGIN_TELTONIKA_MEIG_ASR
++    PREPEND_PLUGIN (teltonika_meig_asr);
++#endif
+ #if defined ENABLE_PLUGIN_THURAYA
+     PREPEND_PLUGIN (thuraya);
+ #endif
+diff --git a/src/plugins/teltonika/77-mm-teltonika-port-types.rules b/src/plugins/teltonika/77-mm-teltonika-port-types.rules
+new file mode 100644
+index 00000000..2c4728b2
+--- /dev/null
++++ b/src/plugins/teltonika/77-mm-teltonika-port-types.rules
+@@ -0,0 +1,20 @@
++# do not edit this file, it will be overwritten on update
++
++ACTION!="add|change|move|bind", GOTO="mm_teltonika_end"
++SUBSYSTEMS=="usb", ATTRS{idVendor}=="1d12", GOTO="mm_teltonika_start"
++GOTO="mm_teltonika_end"
++
++LABEL="mm_teltonika_start"
++SUBSYSTEMS=="usb", ATTRS{bInterfaceNumber}=="?*", ENV{.MM_USBIFNUM}="$attr{bInterfaceNumber}"
++
++# Teltonika ALA440 (ECM)
++#  ttyUSB0 (if #2): ASR DIAG port (ignore for now)
++#  ttyUSB1 (if #3): AT port
++#  ttyUSB2 (if #4): AT port
++#  ttyUSB3 (if #5): GPS data port
++ATTRS{idVendor}=="1d12", ATTRS{idProduct}=="0102", ENV{.MM_USBIFNUM}=="02", SUBSYSTEM=="tty", ENV{ID_MM_PORT_IGNORE}="1"
++ATTRS{idVendor}=="1d12", ATTRS{idProduct}=="0102", ENV{.MM_USBIFNUM}=="03", SUBSYSTEM=="tty", ENV{ID_MM_PORT_TYPE_AT_PRIMARY}="1"
++ATTRS{idVendor}=="1d12", ATTRS{idProduct}=="0102", ENV{.MM_USBIFNUM}=="04", SUBSYSTEM=="tty", ENV{ID_MM_PORT_TYPE_AT_SECONDARY}="1"
++ATTRS{idVendor}=="1d12", ATTRS{idProduct}=="0102", ENV{.MM_USBIFNUM}=="05", SUBSYSTEM=="tty", ENV{ID_MM_PORT_GPS}="1"
++
++LABEL="mm_teltonika_end"
+diff --git a/src/plugins/teltonika/mm-plugin-teltonika-meig-asr.c b/src/plugins/teltonika/mm-plugin-teltonika-meig-asr.c
+new file mode 100644
+index 00000000..e1525bc0
+--- /dev/null
++++ b/src/plugins/teltonika/mm-plugin-teltonika-meig-asr.c
+@@ -0,0 +1,79 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Copyright (C) 2026 TDT AG
++ */
++
++#include "mm-plugin.h"
++#include <gmodule.h>
++
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-log-object.h"
++#include "mm-plugin-common.h"
++#include "mm-broadband-modem-meig-asr.h"
++
++#define MM_TYPE_PLUGIN_TELTONIKA_MEIG_ASR mm_plugin_teltonika_meig_asr_get_type ()
++MM_DEFINE_PLUGIN (TELTONIKA_MEIG_ASR, teltonika_meig_asr, TeltonikaMeigAsr)
++
++static MMBaseModem *
++create_modem (MMPlugin     *self,
++              const gchar  *uid,
++              const gchar  *physdev,
++              const gchar **drivers,
++              guint16       vendor,
++              guint16       product,
++              guint16       subsystem_vendor,
++              guint16       subsystem_device,
++              GList        *probes,
++              GError      **error)
++{
++    mm_obj_dbg (self, "MeiG-ASR based Teltonika modem found");
++    return MM_BASE_MODEM (mm_broadband_modem_meig_asr_new (uid,
++                                                           physdev,
++                                                           drivers,
++                                                           mm_plugin_get_name (self),
++                                                           vendor,
++                                                           product));
++}
++
++MM_PLUGIN_NAMED_CREATOR_SCOPE MMPlugin *
++mm_plugin_create_teltonika_meig_asr (void)
++{
++    static const gchar          *subsystems[] = { "tty", "net", NULL };
++    static const mm_uint16_pair  products[]   = {
++        { 0x1d12, 0x0102 }, /* Teltonika ALA440 */
++        { 0, 0 }
++    };
++
++    return MM_PLUGIN (
++        g_object_new (MM_TYPE_PLUGIN_TELTONIKA_MEIG_ASR,
++                      MM_PLUGIN_NAME,                MM_MODULE_NAME,
++                      MM_PLUGIN_ALLOWED_SUBSYSTEMS,  subsystems,
++                      MM_PLUGIN_ALLOWED_PRODUCT_IDS, products,
++                      MM_PLUGIN_ALLOWED_AT,          TRUE,
++                      NULL));
++}
++
++static void
++mm_plugin_teltonika_meig_asr_init (MMPluginTeltonikaMeigAsr *self)
++{
++}
++
++static void
++mm_plugin_teltonika_meig_asr_class_init (MMPluginTeltonikaMeigAsrClass *klass)
++{
++    MMPluginClass *plugin_class = MM_PLUGIN_CLASS (klass);
++
++    plugin_class->create_modem = create_modem;
++}
+diff --git a/src/plugins/tests/test-udev-rules.c b/src/plugins/tests/test-udev-rules.c
+index fe205a44..023e48a5 100644
+--- a/src/plugins/tests/test-udev-rules.c
++++ b/src/plugins/tests/test-udev-rules.c
+@@ -152,6 +152,14 @@ test_telit (void)
+ }
+ #endif
+ 
++#if defined ENABLE_PLUGIN_TELTONIKA_MEIG_ASR
++static void
++test_teltonika_meig_asr (void)
++{
++    common_test (TESTUDEVRULESDIR_TELTONIKA_MEIG_ASR);
++}
++#endif
++
+ #if defined ENABLE_PLUGIN_MTK_LEGACY
+ static void
+ test_mtk_legacy (void)
+@@ -269,6 +277,9 @@ int main (int argc, char **argv)
+ #if defined ENABLE_PLUGIN_TELIT
+     g_test_add_func ("/MM/test-udev-rules/telit", test_telit);
+ #endif
++#if defined ENABLE_PLUGIN_TELTONIKA_MEIG_ASR
++    g_test_add_func ("/MM/test-udev-rules/teltonika-meig-asr", test_teltonika_meig_asr);
++#endif
+ #if defined ENABLE_PLUGIN_MTK_LEGACY
+     g_test_add_func ("/MM/test-udev-rules/mtk", test_mtk_legacy);
+ #endif

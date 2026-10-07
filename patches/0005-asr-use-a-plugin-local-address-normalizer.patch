@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsOS build <build@localhost>
+Date: Wed, 7 Oct 2026 11:55:19 +0200
+Subject: [PATCH 5/6] asr: use a plugin-local address normalizer
+
+mm_3gpp_normalize_address() only exists in ModemManager main. Keep a
+static copy in the ASR helpers so the plugin loads into an unmodified
+1.24 daemon.
+---
+ src/plugins/asr/mm-modem-helpers-asr.c | 109 +++++++++++++++++++++++--
+ 1 file changed, 104 insertions(+), 5 deletions(-)
+
+diff --git a/src/plugins/asr/mm-modem-helpers-asr.c b/src/plugins/asr/mm-modem-helpers-asr.c
+index 943d8964..fd61b236 100644
+--- a/src/plugins/asr/mm-modem-helpers-asr.c
++++ b/src/plugins/asr/mm-modem-helpers-asr.c
+@@ -16,9 +16,108 @@
+ #include <glib.h>
+ #include <gio/gio.h>
+ 
++#include <string.h>
++
+ #include "mm-modem-helpers.h"
+ #include "mm-modem-helpers-asr.h"
+ 
++/*****************************************************************************/
++/* IP address normalization
++ *
++ * Local copy of mm_3gpp_normalize_address() and its helpers from
++ * ModemManager main, which are not available in the 1.24 daemon. Keeping
++ * them here lets this plugin load into an unmodified 1.24 daemon. */
++
++static guint
++count_separators (const gchar *str,
++                  const gchar  separator)
++{
++    const gchar *found;
++    guint        count = 0;
++
++    found = str;
++    while ((found = strchr (found, separator))) {
++        count++;
++        found++;
++    }
++
++    return count;
++}
++
++static gchar *
++dots_to_v6_address (const gchar  *str,
++                    GError      **error)
++{
++    g_autoptr(GRegex)       r = NULL;
++    g_autoptr(GMatchInfo)   match_info = NULL;
++    guint                   i;
++    g_autoptr(GString)      addr = NULL;
++    g_autoptr(GInetAddress) normalized = NULL;
++
++    r = g_regex_new ("(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)", 0, 0, NULL);
++    g_assert (r != NULL);
++
++    if (!g_regex_match_full (r, str, -1, 0, 0, &match_info, error))
++        return NULL;
++
++    /* Remember that g_match_info_get_match_count() includes match #0 */
++    if (g_match_info_get_match_count (match_info) < 17) {
++        g_set_error_literal (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                             "Failed to match IPv6 address");
++        return NULL;
++    }
++
++    addr = g_string_sized_new (40);
++
++    for (i = 1; i <= 16; i += 2) {
++        guint num1 = 0, num2 = 0;
++
++        if (!mm_get_uint_from_match_info (match_info, i, &num1) ||
++            !mm_get_uint_from_match_info (match_info, i + 1, &num2)) {
++            g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                         "Failed to parse uint from IPv6 regex match %d or %d",
++                         i,
++                         i + 1);
++            return NULL;
++        }
++        g_string_append_printf (addr, "%s%02x%02x", i > 1 ? ":" : "", num1, num2);
++    }
++
++    normalized = g_inet_address_new_from_string (addr->str);
++    if (!normalized) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                     "Failed to parse IP address '%s'",
++                     addr->str);
++        return NULL;
++    }
++
++    return g_inet_address_to_string (normalized);
++}
++
++static gboolean
++asr_normalize_address (const gchar  *address,
++                       gchar       **out_address,
++                       GError      **error)
++{
++    g_autoptr(GInetAddress) a = NULL;
++
++    if (count_separators (address, '.') == 15) {
++        *out_address = dots_to_v6_address (address, error);
++        return !!*out_address;
++    }
++
++    a = g_inet_address_new_from_string (address);
++    if (!a) {
++        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                     "Error normalizing IP address '%s'",
++                     address);
++        return FALSE;
++    }
++
++    *out_address = g_inet_address_to_string (a);
++    return TRUE;
++}
++
+ /*****************************************************************************/
+ /* +GETIP response parser */
+ 
+@@ -32,7 +131,7 @@ assign_ipv4_or_ipv6 (const gchar  *address,
+     g_autofree gchar         *normalized_address = NULL;
+     gchar                   **out_address;
+ 
+-    if (!mm_3gpp_normalize_address (address, &normalized_address, error))
++    if (!asr_normalize_address (address, &normalized_address, error))
+         return FALSE;
+ 
+     inet_address = g_inet_address_new_from_string (normalized_address);
+@@ -216,19 +315,19 @@ mm_asr_parse_cgcontrdp_response_line (const gchar  *response,
+     apn = mm_get_string_unquoted_from_match_info (match_info, 3);
+ 
+     local_address = mm_get_string_unquoted_from_match_info (match_info, 4);
+-    if (local_address && !mm_3gpp_normalize_address (local_address, &normalized_local_address, error))
++    if (local_address && !asr_normalize_address (local_address, &normalized_local_address, error))
+         return FALSE;
+ 
+     gateway = mm_get_string_unquoted_from_match_info (match_info, 5);
+-    if (gateway && !mm_3gpp_normalize_address (gateway, &normalized_gateway, error))
++    if (gateway && !asr_normalize_address (gateway, &normalized_gateway, error))
+         return FALSE;
+ 
+     dns_primary = mm_get_string_unquoted_from_match_info (match_info, 6);
+-    if (dns_primary && !mm_3gpp_normalize_address (dns_primary, &normalized_dns_primary, error))
++    if (dns_primary && !asr_normalize_address (dns_primary, &normalized_dns_primary, error))
+         return FALSE;
+ 
+     dns_secondary = mm_get_string_unquoted_from_match_info (match_info, 7);
+-    if (dns_secondary && !mm_3gpp_normalize_address (dns_secondary, &normalized_dns_secondary, error))
++    if (dns_secondary && !asr_normalize_address (dns_secondary, &normalized_dns_secondary, error))
+         return FALSE;
+ 
+     if (out_cid)
