@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: hoechst <hoechst@trackit.systems>
-Date: Wed, 7 Oct 2026 15:01:34 +0200
+From: =?UTF-8?q?Jonas=20H=C3=B6chst?= <hoechst@trackit.systems>
+Date: Wed, 7 Oct 2026 12:59:51 +0200
 Subject: [PATCH] asr, meig: define shared module version info
 
 ModemManager only loads external shared modules that export

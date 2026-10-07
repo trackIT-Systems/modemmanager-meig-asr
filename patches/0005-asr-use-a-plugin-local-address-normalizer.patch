@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: hoechst <hoechst@trackit.systems>
-Date: Wed, 7 Oct 2026 15:01:34 +0200
+From: =?UTF-8?q?Jonas=20H=C3=B6chst?= <hoechst@trackit.systems>
+Date: Wed, 7 Oct 2026 11:55:19 +0200
 Subject: [PATCH] asr: use a plugin-local address normalizer
 
 mm_3gpp_normalize_address() only exists in ModemManager main. Keep a
