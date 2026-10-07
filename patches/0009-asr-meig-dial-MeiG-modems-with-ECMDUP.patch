@@ -1,0 +1,615 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsOS build <build@localhost>
+Date: Wed, 7 Oct 2026 14:34:51 +0200
+Subject: [PATCH] asr, meig: dial MeiG modems with +ECMDUP
+
+On MeiG ASR modems, a context activated with +CGACT is not routed to the
+RNDIS/ECM network interface: the bearer was reported connected and DHCP
+worked, but no traffic passed (this went unnoticed while the modem's own
+auto-dial session from power-on was still in place). +ECMDUP is the
+complete dial command for the network interface: it activates the context
+itself and connects it. Activating the context with +CGACT first makes the
+following +ECMDUP fail.
+
+Add an "ECM dial" option to the ASR modem and bearer, enabled by the MeiG
+modem:
+ - dial: +CGDCONT and *AUTHREQ as before, then
+   +ECMDUP=<cid>,1,<pdp type>,<apn> instead of +CGACT
+ - hang up: +ECMDUP=<cid>,0, then +CGACT=0,<cid> with errors ignored (the
+   context may be the LTE default bearer, which stays active)
+ - connection status: from +ECMDUP? instead of +CGACT?, since the context
+   stays active when the modem drops the connection
+---
+ src/plugins/asr/mm-broadband-bearer-asr.c     | 236 +++++++++++++++++-
+ src/plugins/asr/mm-broadband-bearer-asr.h     |   2 +
+ src/plugins/asr/mm-broadband-modem-asr.c      |  17 ++
+ src/plugins/asr/mm-broadband-modem-asr.h      |   1 +
+ src/plugins/asr/mm-modem-helpers-asr.c        |  54 ++++
+ src/plugins/asr/mm-modem-helpers-asr.h        |   6 +
+ .../asr/tests/test-modem-helpers-asr.c        |  38 +++
+ .../meig/mm-broadband-modem-meig-asr.c        |   1 +
+ 8 files changed, 345 insertions(+), 10 deletions(-)
+
+diff --git a/src/plugins/asr/mm-broadband-bearer-asr.c b/src/plugins/asr/mm-broadband-bearer-asr.c
+index 017dbd28..e04bf2d4 100644
+--- a/src/plugins/asr/mm-broadband-bearer-asr.c
++++ b/src/plugins/asr/mm-broadband-bearer-asr.c
+@@ -29,6 +29,7 @@ G_DEFINE_TYPE (MMBroadbandBearerAsr, mm_broadband_bearer_asr, MM_TYPE_BROADBAND_
+ enum {
+     PROP_0,
+     PROP_DEFAULT_IP_METHOD,
++    PROP_ECM_DIAL,
+     PROP_LAST
+ };
+ 
+@@ -36,6 +37,7 @@ static GParamSpec *properties[PROP_LAST];
+ 
+ struct _MMBroadbandBearerAsrPrivate {
+     MMBearerIpMethod default_ip_method;
++    gboolean         ecm_dial;
+ };
+ 
+ /*****************************************************************************/
+@@ -46,6 +48,7 @@ typedef enum {
+     DIAL_3GPP_STEP_REDEFINE_PDP_CONTEXT,
+     DIAL_3GPP_STEP_AUTHENTICATE,
+     DIAL_3GPP_STEP_ACTIVATE,
++    DIAL_3GPP_STEP_ECM_DIAL,
+     DIAL_3GPP_STEP_LAST,
+ } CustomInitStep;
+ 
+@@ -170,11 +173,47 @@ dial_3gpp_step (GTask *task)
+     }
+ 
+     case DIAL_3GPP_STEP_ACTIVATE:
++        /* +ECMDUP activates the context itself; activating it with +CGACT
++         * first makes the following +ECMDUP fail */
++        if (self->priv->ecm_dial) {
++            ctx->step++;
++            dial_3gpp_step (task);
++            return;
++        }
+         cmd = g_strdup_printf ("+CGACT=1,%u", ctx->cid);
+         mm_obj_dbg (self, "activating context #%u...", ctx->cid);
+         mm_base_modem_at_command (ctx->modem, cmd, MM_BASE_BEARER_DEFAULT_CONNECTION_TIMEOUT, FALSE, (GAsyncReadyCallback) dial_3gpp_command_ready, task);
+         return;
+ 
++    case DIAL_3GPP_STEP_ECM_DIAL: {
++        MMBearerIpFamily  ip_family;
++        guint             pdp_type;
++        g_autofree gchar *quoted_apn = NULL;
++
++        if (!self->priv->ecm_dial) {
++            ctx->step++;
++            dial_3gpp_step (task);
++            return;
++        }
++
++        /* +ECMDUP activates the context and connects it to the network
++         * interface (pdp type 0: IPv4, 1: IPv6, 2: IPv4v6). Authentication
++         * was already set up with *AUTHREQ. */
++        ip_family = mm_3gpp_profile_get_ip_type (ctx->profile);
++        if (ip_family == MM_BEARER_IP_FAMILY_IPV6)
++            pdp_type = 1;
++        else if (ip_family == MM_BEARER_IP_FAMILY_IPV4V6)
++            pdp_type = 2;
++        else
++            pdp_type = 0;
++
++        quoted_apn = mm_at_quote_string (mm_3gpp_profile_get_apn (ctx->profile));
++        cmd = g_strdup_printf ("+ECMDUP=%u,1,%u,%s", ctx->cid, pdp_type, quoted_apn);
++        mm_obj_dbg (self, "activating context #%u and connecting it to the network interface...", ctx->cid);
++        mm_base_modem_at_command (ctx->modem, cmd, MM_BASE_BEARER_DEFAULT_CONNECTION_TIMEOUT, FALSE, (GAsyncReadyCallback) dial_3gpp_command_ready, task);
++        return;
++    }
++
+     case DIAL_3GPP_STEP_LAST:
+         g_task_return_pointer (task, g_object_ref (ctx->data), g_object_unref);
+         g_object_unref (task);
+@@ -460,15 +499,70 @@ cgact_deactivate_ready (MMBaseModem  *modem,
+                         GAsyncResult *res,
+                         GTask        *task)
+ {
+-    GError *error = NULL;
++    MMBroadbandBearerAsr *self;
++    GError               *error = NULL;
+ 
+-    if (!mm_base_modem_at_command_finish (modem, res, &error))
+-        g_task_return_error (task, error);
+-    else
+-        g_task_return_boolean (task, TRUE);
++    self = g_task_get_source_object (task);
++
++    if (!mm_base_modem_at_command_finish (modem, res, &error)) {
++        /* With +ECMDUP the connection is already gone; the context may stay
++         * active, e.g. if it is the LTE default bearer */
++        if (!self->priv->ecm_dial) {
++            g_task_return_error (task, error);
++            g_object_unref (task);
++            return;
++        }
++        mm_obj_dbg (self, "couldn't deactivate PDP context: %s", error->message);
++        g_error_free (error);
++    }
++    g_task_return_boolean (task, TRUE);
+     g_object_unref (task);
+ }
+ 
++typedef struct {
++    MMBaseModem *modem;
++    guint        cid;
++} DisconnectContext;
++
++static void
++disconnect_context_free (DisconnectContext *ctx)
++{
++    g_object_unref (ctx->modem);
++    g_slice_free (DisconnectContext, ctx);
++}
++
++static void
++cgact_deactivate (GTask *task)
++{
++    DisconnectContext *ctx;
++    g_autofree gchar  *cmd = NULL;
++
++    ctx = g_task_get_task_data (task);
++
++    cmd = g_strdup_printf ("+CGACT=0,%u", ctx->cid);
++    mm_obj_dbg (g_task_get_source_object (task), "deactivating PDP context #%u...", ctx->cid);
++    mm_base_modem_at_command (ctx->modem,
++                              cmd,
++                              MM_BASE_BEARER_DEFAULT_DISCONNECTION_TIMEOUT,
++                              FALSE,
++                              (GAsyncReadyCallback) cgact_deactivate_ready,
++                              task);
++}
++
++static void
++ecmdup_disconnect_ready (MMBaseModem  *modem,
++                         GAsyncResult *res,
++                         GTask        *task)
++{
++    g_autoptr(GError) error = NULL;
++
++    /* Not fatal: the modem may already have ended the connection itself */
++    if (!mm_base_modem_at_command_finish (modem, res, &error))
++        mm_obj_dbg (g_task_get_source_object (task), "couldn't disconnect from the network interface: %s", error->message);
++
++    cgact_deactivate (task);
++}
++
+ static void
+ disconnect_3gpp (MMBroadbandBearer   *self,
+                  MMBroadbandModem    *modem,
+@@ -479,18 +573,116 @@ disconnect_3gpp (MMBroadbandBearer   *self,
+                  GAsyncReadyCallback  callback,
+                  gpointer             user_data)
+ {
+-    GTask            *task;
+-    g_autofree gchar *cmd = NULL;
++    GTask             *task;
++    DisconnectContext *ctx;
++    g_autofree gchar  *cmd = NULL;
++
++    ctx        = g_slice_new0 (DisconnectContext);
++    ctx->modem = MM_BASE_MODEM (g_object_ref (modem));
++    ctx->cid   = cid;
+ 
+     task = g_task_new (self, NULL, callback, user_data);
++    g_task_set_task_data (task, ctx, (GDestroyNotify) disconnect_context_free);
+ 
+-    cmd = g_strdup_printf ("+CGACT=0,%u", cid);
+-    mm_obj_dbg (self, "deactivating PDP context #%u...", cid);
++    if (!MM_BROADBAND_BEARER_ASR (self)->priv->ecm_dial) {
++        cgact_deactivate (task);
++        return;
++    }
++
++    cmd = g_strdup_printf ("+ECMDUP=%u,0", cid);
++    mm_obj_dbg (self, "disconnecting context #%u from the network interface...", cid);
+     mm_base_modem_at_command (MM_BASE_MODEM (modem),
+                               cmd,
+                               MM_BASE_BEARER_DEFAULT_DISCONNECTION_TIMEOUT,
+                               FALSE,
+-                              (GAsyncReadyCallback) cgact_deactivate_ready,
++                              (GAsyncReadyCallback) ecmdup_disconnect_ready,
++                              task);
++}
++
++/*****************************************************************************/
++/* Connection status monitoring */
++
++static MMBearerConnectionStatus
++load_connection_status_finish (MMBaseBearer  *self,
++                               GAsyncResult  *res,
++                               GError       **error)
++{
++    GError *inner_error = NULL;
++    gssize  value;
++
++    if (!MM_BROADBAND_BEARER_ASR (self)->priv->ecm_dial)
++        return MM_BASE_BEARER_CLASS (mm_broadband_bearer_asr_parent_class)->load_connection_status_finish (self, res, error);
++
++    value = g_task_propagate_int (G_TASK (res), &inner_error);
++    if (inner_error) {
++        g_propagate_error (error, inner_error);
++        return MM_BEARER_CONNECTION_STATUS_UNKNOWN;
++    }
++    return (MMBearerConnectionStatus) value;
++}
++
++static void
++ecmdup_query_ready (MMBaseModem  *modem,
++                    GAsyncResult *res,
++                    GTask        *task)
++{
++    MMBaseBearer *self;
++    const gchar  *response;
++    GError       *error = NULL;
++    gboolean      connected = FALSE;
++
++    self = g_task_get_source_object (task);
++
++    response = mm_base_modem_at_command_finish (modem, res, &error);
++    if (!response) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    if (!mm_asr_parse_ecmdup_read_response (response,
++                                            (guint) mm_base_bearer_get_profile_id (self),
++                                            &connected,
++                                            &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    g_task_return_int (task, connected ? MM_BEARER_CONNECTION_STATUS_CONNECTED : MM_BEARER_CONNECTION_STATUS_DISCONNECTED);
++    g_object_unref (task);
++}
++
++static void
++load_connection_status (MMBaseBearer        *self,
++                        GAsyncReadyCallback  callback,
++                        gpointer             user_data)
++{
++    GTask                  *task;
++    g_autoptr(MMBaseModem)  modem = NULL;
++
++    /* The context stays active when the modem drops the +ECMDUP connection,
++     * so +CGACT? can't tell; ask +ECMDUP? instead */
++    if (!MM_BROADBAND_BEARER_ASR (self)->priv->ecm_dial) {
++        MM_BASE_BEARER_CLASS (mm_broadband_bearer_asr_parent_class)->load_connection_status (self, callback, user_data);
++        return;
++    }
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    if (mm_base_bearer_get_profile_id (self) == MM_3GPP_PROFILE_ID_UNKNOWN) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                 "Couldn't load connection status: cid not defined");
++        g_object_unref (task);
++        return;
++    }
++
++    g_object_get (self, MM_BASE_BEARER_MODEM, &modem, NULL);
++    mm_base_modem_at_command (modem,
++                              "+ECMDUP?",
++                              3,
++                              FALSE,
++                              (GAsyncReadyCallback) ecmdup_query_ready,
+                               task);
+ }
+ 
+@@ -519,6 +711,7 @@ mm_broadband_bearer_asr_new_finish (GAsyncResult  *res,
+ void
+ mm_broadband_bearer_asr_new (MMBroadbandModem    *modem,
+                              MMBearerIpMethod     ip_method,
++                             gboolean             ecm_dial,
+                              MMBearerProperties  *config,
+                              GCancellable        *cancellable,
+                              GAsyncReadyCallback  callback,
+@@ -533,6 +726,7 @@ mm_broadband_bearer_asr_new (MMBroadbandModem    *modem,
+         MM_BASE_BEARER_MODEM,                      modem,
+         MM_BASE_BEARER_CONFIG,                     config,
+         MM_BROADBAND_BEARER_ASR_DEFAULT_IP_METHOD, ip_method,
++        MM_BROADBAND_BEARER_ASR_ECM_DIAL,          ecm_dial,
+         NULL);
+ }
+ 
+@@ -548,6 +742,9 @@ set_property (GObject      *object,
+     case PROP_DEFAULT_IP_METHOD:
+         self->priv->default_ip_method = g_value_get_enum (value);
+         break;
++    case PROP_ECM_DIAL:
++        self->priv->ecm_dial = g_value_get_boolean (value);
++        break;
+     default:
+         G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+         break;
+@@ -566,6 +763,9 @@ get_property (GObject    *object,
+     case PROP_DEFAULT_IP_METHOD:
+         g_value_set_enum (value, self->priv->default_ip_method);
+         break;
++    case PROP_ECM_DIAL:
++        g_value_set_boolean (value, self->priv->ecm_dial);
++        break;
+     default:
+         G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+         break;
+@@ -589,6 +789,7 @@ mm_broadband_bearer_asr_class_init (MMBroadbandBearerAsrClass *klass)
+ {
+     GObjectClass           *object_class           = G_OBJECT_CLASS (klass);
+     MMBroadbandBearerClass *broadband_bearer_class = MM_BROADBAND_BEARER_CLASS (klass);
++    MMBaseBearerClass      *base_bearer_class      = MM_BASE_BEARER_CLASS (klass);
+ 
+     g_type_class_add_private (object_class, sizeof (MMBroadbandBearerAsrPrivate));
+ 
+@@ -601,6 +802,13 @@ mm_broadband_bearer_asr_class_init (MMBroadbandBearerAsrClass *klass)
+     broadband_bearer_class->disconnect_3gpp           = disconnect_3gpp;
+     broadband_bearer_class->disconnect_3gpp_finish    = disconnect_3gpp_finish;
+ 
++    base_bearer_class->load_connection_status          = load_connection_status;
++    base_bearer_class->load_connection_status_finish   = load_connection_status_finish;
++#if defined WITH_SUSPEND_RESUME
++    base_bearer_class->reload_connection_status        = load_connection_status;
++    base_bearer_class->reload_connection_status_finish = load_connection_status_finish;
++#endif
++
+     properties[PROP_DEFAULT_IP_METHOD] =
+         g_param_spec_enum (MM_BROADBAND_BEARER_ASR_DEFAULT_IP_METHOD,
+                            "Default IP method",
+@@ -609,4 +817,12 @@ mm_broadband_bearer_asr_class_init (MMBroadbandBearerAsrClass *klass)
+                            MM_BEARER_IP_METHOD_DHCP,
+                            G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY);
+     g_object_class_install_property (object_class, PROP_DEFAULT_IP_METHOD, properties[PROP_DEFAULT_IP_METHOD]);
++
++    properties[PROP_ECM_DIAL] =
++        g_param_spec_boolean (MM_BROADBAND_BEARER_ASR_ECM_DIAL,
++                              "ECM dial",
++                              "Connect the context to the network interface with +ECMDUP after activation.",
++                              FALSE,
++                              G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY);
++    g_object_class_install_property (object_class, PROP_ECM_DIAL, properties[PROP_ECM_DIAL]);
+ }
+diff --git a/src/plugins/asr/mm-broadband-bearer-asr.h b/src/plugins/asr/mm-broadband-bearer-asr.h
+index 5084ac30..cf05b06c 100644
+--- a/src/plugins/asr/mm-broadband-bearer-asr.h
++++ b/src/plugins/asr/mm-broadband-bearer-asr.h
+@@ -18,6 +18,7 @@
+ G_DECLARE_FINAL_TYPE (MMBroadbandBearerAsr, mm_broadband_bearer_asr, MM, BROADBAND_BEARER_ASR, MMBroadbandBearer)
+ 
+ #define MM_BROADBAND_BEARER_ASR_DEFAULT_IP_METHOD "broadband-bearer-asr-default-ip-method"
++#define MM_BROADBAND_BEARER_ASR_ECM_DIAL          "broadband-bearer-asr-ecm-dial"
+ 
+ typedef struct _MMBroadbandBearerAsrPrivate MMBroadbandBearerAsrPrivate;
+ 
+@@ -31,6 +32,7 @@ struct _MMBroadbandBearerAsr {
+ 
+ void          mm_broadband_bearer_asr_new (MMBroadbandModem    *modem,
+                                            MMBearerIpMethod     ip_method,
++                                           gboolean             ecm_dial,
+                                            MMBearerProperties  *config,
+                                            GCancellable        *cancellable,
+                                            GAsyncReadyCallback  callback,
+diff --git a/src/plugins/asr/mm-broadband-modem-asr.c b/src/plugins/asr/mm-broadband-modem-asr.c
+index 8d15a6b8..5b9c2893 100644
+--- a/src/plugins/asr/mm-broadband-modem-asr.c
++++ b/src/plugins/asr/mm-broadband-modem-asr.c
+@@ -42,6 +42,7 @@ G_DEFINE_TYPE_EXTENDED (MMBroadbandModemAsr, mm_broadband_modem_asr, MM_TYPE_BRO
+ enum {
+     PROP_0,
+     PROP_DEFAULT_IP_METHOD,
++    PROP_ECM_DIAL,
+     PROP_LAST
+ };
+ 
+@@ -49,6 +50,7 @@ static GParamSpec *properties[PROP_LAST];
+ 
+ struct _MMBroadbandModemAsrPrivate {
+     MMBearerIpMethod  default_ip_method;
++    gboolean          ecm_dial;
+     GRegex           *connect_regex;
+ };
+ 
+@@ -172,6 +174,7 @@ modem_create_bearer (MMIfaceModem        *self,
+ 
+     mm_broadband_bearer_asr_new (MM_BROADBAND_MODEM (self),
+                                  MM_BROADBAND_MODEM_ASR (self)->priv->default_ip_method,
++                                 MM_BROADBAND_MODEM_ASR (self)->priv->ecm_dial,
+                                  bearer_properties,
+                                  NULL,
+                                  (GAsyncReadyCallback) bearer_new_ready,
+@@ -470,6 +473,9 @@ set_property (GObject      *object,
+     case PROP_DEFAULT_IP_METHOD:
+         self->priv->default_ip_method = g_value_get_enum (value);
+         break;
++    case PROP_ECM_DIAL:
++        self->priv->ecm_dial = g_value_get_boolean (value);
++        break;
+     default:
+         G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+         break;
+@@ -488,6 +494,9 @@ get_property (GObject    *object,
+     case PROP_DEFAULT_IP_METHOD:
+         g_value_set_enum (value, self->priv->default_ip_method);
+         break;
++    case PROP_ECM_DIAL:
++        g_value_set_boolean (value, self->priv->ecm_dial);
++        break;
+     default:
+         G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+         break;
+@@ -577,4 +586,12 @@ mm_broadband_modem_asr_class_init (MMBroadbandModemAsrClass *klass)
+                            MM_BEARER_IP_METHOD_DHCP,
+                            G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY);
+     g_object_class_install_property (object_class, PROP_DEFAULT_IP_METHOD, properties[PROP_DEFAULT_IP_METHOD]);
++
++    properties[PROP_ECM_DIAL] =
++        g_param_spec_boolean (MM_BROADBAND_MODEM_ASR_ECM_DIAL,
++                              "ECM dial",
++                              "Connect bearers to the network interface with +ECMDUP after activation.",
++                              FALSE,
++                              G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY);
++    g_object_class_install_property (object_class, PROP_ECM_DIAL, properties[PROP_ECM_DIAL]);
+ }
+diff --git a/src/plugins/asr/mm-broadband-modem-asr.h b/src/plugins/asr/mm-broadband-modem-asr.h
+index dc996d58..8d64708e 100644
+--- a/src/plugins/asr/mm-broadband-modem-asr.h
++++ b/src/plugins/asr/mm-broadband-modem-asr.h
+@@ -22,6 +22,7 @@
+ G_DECLARE_FINAL_TYPE (MMBroadbandModemAsr, mm_broadband_modem_asr, MM, BROADBAND_MODEM_ASR, MMBroadbandModem)
+ 
+ #define MM_BROADBAND_MODEM_ASR_DEFAULT_IP_METHOD "broadband-modem-asr-default-ip-method"
++#define MM_BROADBAND_MODEM_ASR_ECM_DIAL          "broadband-modem-asr-ecm-dial"
+ 
+ typedef struct _MMBroadbandModemAsrPrivate MMBroadbandModemAsrPrivate;
+ 
+diff --git a/src/plugins/asr/mm-modem-helpers-asr.c b/src/plugins/asr/mm-modem-helpers-asr.c
+index fd61b236..6369838c 100644
+--- a/src/plugins/asr/mm-modem-helpers-asr.c
++++ b/src/plugins/asr/mm-modem-helpers-asr.c
+@@ -477,3 +477,57 @@ mm_asr_build_authreq_command (guint                cid,
+                                 quoted_password);
+     return TRUE;
+ }
++
++/*****************************************************************************/
++/* +ECMDUP? response parser
++ *
++ * One line per connection, e.g.:
++ *   +ECMDUP: 1,1,"IPV4",2,"IPV6"
++ * with the cid followed by the IPv4 and IPv6 states (1: connected). No line
++ * at all if nothing is connected. */
++
++gboolean
++mm_asr_parse_ecmdup_read_response (const gchar  *response,
++                                   guint         cid,
++                                   gboolean     *out_connected,
++                                   GError      **error)
++{
++    g_autoptr(GRegex)     r = NULL;
++    g_autoptr(GMatchInfo) match_info = NULL;
++    g_autoptr(GError)     inner_error = NULL;
++
++    g_assert (out_connected);
++    *out_connected = FALSE;
++
++    r = g_regex_new ("\\+ECMDUP:\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*\"[^\"]*\"\\s*(?:,\\s*(\\d+))?",
++                     G_REGEX_RAW, 0, NULL);
++    g_assert (r != NULL);
++
++    g_regex_match_full (r, response, strlen (response), 0, 0, &match_info, &inner_error);
++    while (!inner_error && g_match_info_matches (match_info)) {
++        guint line_cid = 0;
++        guint ipv4_state = 0;
++        guint ipv6_state = 0;
++
++        if (!mm_get_uint_from_match_info (match_info, 1, &line_cid) ||
++            !mm_get_uint_from_match_info (match_info, 2, &ipv4_state)) {
++            g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                         "Couldn't parse +ECMDUP response: '%s'", response);
++            return FALSE;
++        }
++        /* the IPv6 state is optional */
++        mm_get_uint_from_match_info (match_info, 3, &ipv6_state);
++
++        if (line_cid == cid && (ipv4_state == 1 || ipv6_state == 1)) {
++            *out_connected = TRUE;
++            return TRUE;
++        }
++        g_match_info_next (match_info, &inner_error);
++    }
++
++    if (inner_error) {
++        g_propagate_error (error, g_steal_pointer (&inner_error));
++        return FALSE;
++    }
++    return TRUE;
++}
+diff --git a/src/plugins/asr/mm-modem-helpers-asr.h b/src/plugins/asr/mm-modem-helpers-asr.h
+index b4280177..6a6d0edb 100644
+--- a/src/plugins/asr/mm-modem-helpers-asr.h
++++ b/src/plugins/asr/mm-modem-helpers-asr.h
+@@ -57,4 +57,10 @@ gboolean mm_asr_build_authreq_command (guint                cid,
+                                        gchar              **out_cmd,
+                                        GError             **error);
+ 
++/* +ECMDUP? response parser (MeiG) */
++gboolean mm_asr_parse_ecmdup_read_response (const gchar  *response,
++                                            guint         cid,
++                                            gboolean     *out_connected,
++                                            GError      **error);
++
+ #endif /* MM_MODEM_HELPERS_ASR_H */
+diff --git a/src/plugins/asr/tests/test-modem-helpers-asr.c b/src/plugins/asr/tests/test-modem-helpers-asr.c
+index 5c91c39c..7d7abca4 100644
+--- a/src/plugins/asr/tests/test-modem-helpers-asr.c
++++ b/src/plugins/asr/tests/test-modem-helpers-asr.c
+@@ -369,6 +369,43 @@ test_authreq (void)
+ 
+ /*****************************************************************************/
+ 
++typedef struct {
++    const gchar *response;
++    guint        cid;
++    gboolean     connected;
++} EcmdupTest;
++
++static const EcmdupTest ecmdup_tests[] = {
++    { "\r\nOK\r\n", 1, FALSE },
++    { "\r\n+ECMDUP: 1,1,\"IPV4\",0,\"IPV6\"\r\n\r\nOK\r\n", 1, TRUE },
++    { "\r\n+ECMDUP: 1,1,\"IPV4\",2,\"IPV6\"\r\n\r\nOK\r\n", 1, TRUE },
++    { "\r\n+ECMDUP: 1,1,\"IPV4\",2,\"IPV6\"\r\n\r\nOK\r\n", 2, FALSE },
++    { "\r\n+ECMDUP: 2,0,\"IPV4\",1,\"IPV6\"\r\n\r\nOK\r\n", 2, TRUE },
++    { "\r\n+ECMDUP: 2,0,\"IPV4\",0,\"IPV6\"\r\n\r\nOK\r\n", 2, FALSE },
++    { "+ECMDUP: 1,1,\"IPV4\"", 1, TRUE },
++    { "\r\n+ECMDUP: 1,0,\"IPV4\",0,\"IPV6\"\r\n+ECMDUP: 3,1,\"IPV4\",0,\"IPV6\"\r\n\r\nOK\r\n", 3, TRUE },
++};
++
++static void
++test_ecmdup (void)
++{
++    guint i;
++
++    for (i = 0; i < G_N_ELEMENTS (ecmdup_tests); i++) {
++        g_autoptr(GError) error = NULL;
++        gboolean          connected = TRUE;
++        gboolean          success;
++
++        success = mm_asr_parse_ecmdup_read_response (ecmdup_tests[i].response,
++                                                     ecmdup_tests[i].cid,
++                                                     &connected,
++                                                     &error);
++        g_assert_no_error (error);
++        g_assert_true (success);
++        g_assert_cmpint (connected, ==, ecmdup_tests[i].connected);
++    }
++}
++
+ int
+ main (int argc, char **argv)
+ {
+@@ -380,6 +417,7 @@ main (int argc, char **argv)
+     g_test_add_func ("/MM/asr/cgcontrdp_line", test_cgcontrdp_line);
+     g_test_add_func ("/MM/asr/cgcontrdp", test_cgcontrdp);
+     g_test_add_func ("/MM/asr/authreq", test_authreq);
++    g_test_add_func ("/MM/asr/ecmdup", test_ecmdup);
+ 
+     return g_test_run ();
+ }
+diff --git a/src/plugins/meig/mm-broadband-modem-meig-asr.c b/src/plugins/meig/mm-broadband-modem-meig-asr.c
+index d1dc0c55..7b0c9b05 100644
+--- a/src/plugins/meig/mm-broadband-modem-meig-asr.c
++++ b/src/plugins/meig/mm-broadband-modem-meig-asr.c
+@@ -247,6 +247,7 @@ mm_broadband_modem_meig_asr_new (const gchar  *device,
+                       MM_BASE_MODEM_PRODUCT_ID,         product_id,
+                       MM_BASE_MODEM_DATA_NET_SUPPORTED, TRUE,
+                       MM_BASE_MODEM_DATA_TTY_SUPPORTED, FALSE,
++                      MM_BROADBAND_MODEM_ASR_ECM_DIAL,  TRUE,
+                       NULL));
+ }
+ 
