@@ -173,11 +173,13 @@ Known issues:
   DHCP. NetworkManager's immediate retry succeeded.
 * `ttyUSB3` (GPS) is reported as an unhandled port. There's no location support yet.
 * No global IPv6 address on `usb0` with an `ipv4v6` context.
-* On a Pi 5 with the default 600 mA USB current limit, the USB power switch
-  tripped (`over-current change` on all ports) several times, mostly under
-  data load, and the modem re-enumerated. ModemManager and NetworkManager
-  reconnected on their own within ~40 s. That's a power-supply issue, not a
-  plugin issue.
+* **Pi 5 power:** with a 3 A supply, the Pi 5 limits all USB ports together to
+  600 mA. The USB power switch then tripped (`over-current change` on all ports)
+  several times, mostly under data load, and the modem re-enumerated.
+  ModemManager and NetworkManager reconnected on their own within ~40 s.
+  With a 5 A supply (USB limit lifted automatically, `usb_max_current_enable=1`),
+  5 × 2 MB downloads and 2 × 1 MB uploads ran without a single trip. **Use a 5 A
+  supply** (or a powered hub) for the TRM200 on a Pi 5.
 
 ## License
 
