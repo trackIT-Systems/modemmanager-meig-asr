@@ -46,7 +46,7 @@ jobs:
         run: ./check-symbols.sh
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: modemmanager-meig-asr-arm64
           path: dist/*.tar.gz
