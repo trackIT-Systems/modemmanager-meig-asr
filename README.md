@@ -51,6 +51,7 @@ Switching a TRM200 between modes is persistent and reboots the modem:
 | 0006 | local: adds the RNDIS variant `2dee:4d57` (TRM200) |
 | 0007 | local: `MM_DEFINE_SHARED` for `shared-asr`/`shared-meig`. The MR lacks it, so these modules don't load unless plugins are built in |
 | 0008 | local: skip the `ATZ` init, which the modem answers with `ERROR`. Otherwise enabling fails at boot, after MM restarts and after inhibition |
+| 0009 | local: MeiG modems dial and hang up with `+ECMDUP` and report the connection status from `+ECMDUP?`. With `+CGACT` (as in the MR) the context isn't routed to the network interface |
 
 `build.sh` also makes `libmm-shared-meig.so` depend on `libmm-shared-asr.so`
 (`DT_NEEDED` + `RUNPATH=$ORIGIN`). ModemManager opens shared modules in
@@ -179,26 +180,31 @@ with tsOS and Debian's `modemmanager 1.24.0-1+deb13u1`:
   `rndis_host`) and ECM (`2dee:4d58`, `cdc_ether`). The modem reports LTE, the
   packet service is attached, and NetworkManager connects with a normal `gsm`
   profile (APN only).
-* The plugin dials with `+CGDCONT`/`+CGACT` on cid 2. `usb0` gets a DHCP lease
-  with a /30, /29 or /26 and a real gateway in the carrier network, so there's no
-  clash with the tsOS hotspot. `169.254.0.1` is only the DHCP server identifier,
-  in both modes.
+* The MeiG plugin dials with `+CGDCONT`, `*AUTHREQ` and then
+  `+ECMDUP=<cid>,1,<pdp type>,"<apn>"`, hangs up with `+ECMDUP=<cid>,0`, and
+  polls the connection status with `+ECMDUP?` (patch 0009). `usb0` gets a DHCP
+  lease with a /29 or /30 and a real gateway in the carrier network, so there's
+  no clash with the tsOS hotspot. `169.254.0.1` is only the DHCP server
+  identifier, in both modes.
 * IPv4 traffic works (ping, HTTPS). A 2 MB download ran at ~4.7 Mbit/s over ECM
   and ~3.8 Mbit/s over RNDIS (single samples, LTE Cat 1, roaming).
+* With data checked after each step: 5 of 5 NetworkManager disconnect/reconnect
+  cycles, a ModemManager restart and a USB re-plug.
+* A connection dropped by the modem (`+ECMDUP=<cid>,0` behind ModemManager's
+  back) was detected within ~10 s; NetworkManager reconnected and data flowed
+  again ~15 s after the drop.
 * Enabling works at hot-plug, after a ModemManager restart and after
   inhibition, because `ATZ` isn't sent.
 
-Known issues:
+Why `+ECMDUP` and not `+CGACT` (tested on firmware `SLM770A_A.57.3_EQ102`):
 
-* **Data path after reconnects (blocks a release):** the ASR base dials with
-  `+CGACT` only. In RNDIS mode that activates the PDP context but doesn't
-  reliably connect it to `usb0`. After a ModemManager restart (radio off/on),
-  NetworkManager reports a connection with a valid DHCP lease, but no traffic
-  passes. `AT+ECMDUP=<cid>,1` on the same context makes traffic flow
-  immediately. It worked in earlier tests only because the forwarding set up at
-  modem power-on survived. Fix: dial with `AT+ECMDUP` in the MeiG plugin.
-* The first connect after a ModemManager restart once timed out waiting for
-  DHCP. NetworkManager's immediate retry succeeded.
+* A context activated with `+CGACT` is not routed to `usb0`. NetworkManager
+  reported a connection with a valid DHCP lease, but no traffic passed.
+* `+ECMDUP=<cid>,1,…,"<apn>"` activates the context itself and connects it.
+  Activating it with `+CGACT` first makes the following `+ECMDUP` fail.
+* `+ECMDUP=<cid>,0` disconnects `usb0`; the LTE default bearer stays active.
+
+Known issues:
 * `ttyUSB3` (GPS) is reported as an unhandled port. There's no location support yet.
 * No global IPv6 address on `usb0` with an `ipv4v6` context.
 * **Pi 5 power:** with a 3 A supply, the Pi 5 limits all USB ports together to
