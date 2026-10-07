@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tsOS build <build@localhost>
+Date: Wed, 7 Oct 2026 13:23:54 +0200
+Subject: [PATCH] asr: skip the ATZ modem init
+
+ASR-based MeiG modems answer ATZ with ERROR. ModemManager runs it when
+enabling a modem that was not hotplugged (at boot, after MM restarts
+or inhibition), so enabling failed in a loop. Like the altair plugin,
+drop the init step.
+---
+ src/plugins/asr/mm-broadband-modem-asr.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/plugins/asr/mm-broadband-modem-asr.c b/src/plugins/asr/mm-broadband-modem-asr.c
+index fb336a4c..8d15a6b8 100644
+--- a/src/plugins/asr/mm-broadband-modem-asr.c
++++ b/src/plugins/asr/mm-broadband-modem-asr.c
+@@ -564,6 +564,10 @@ mm_broadband_modem_asr_class_init (MMBroadbandModemAsrClass *klass)
+     broadband_modem_class->load_initial_eps_bearer_cid        = load_initial_eps_bearer_cid;
+     broadband_modem_class->load_initial_eps_bearer_cid_finish = load_initial_eps_bearer_cid_finish;
+     broadband_modem_class->setup_ports                        = setup_ports;
++    /* ATZ is not supported (returns ERROR), which would make enabling fail
++     * whenever the modem was not hotplugged, e.g. at boot or after inhibition */
++    broadband_modem_class->enabling_modem_init                = NULL;
++    broadband_modem_class->enabling_modem_init_finish         = NULL;
+ 
+     properties[PROP_DEFAULT_IP_METHOD] =
+         g_param_spec_enum (MM_BROADBAND_MODEM_ASR_DEFAULT_IP_METHOD,

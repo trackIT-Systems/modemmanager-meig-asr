@@ -9,6 +9,8 @@
 - Define shared-module version info for `shared-asr` and `shared-meig` (missing in MR !1502). Without it, ModemManager refuses to load them.
 - Make `libmm-shared-meig.so` depend on `libmm-shared-asr.so`, so it loads regardless of directory order.
 - `check-symbols.sh` also checks module version exports and that shared-module dependency.
-- Tested on a Teltonika TRM200: connects via NetworkManager, IPv4 data works.
+- Skip the `ATZ` init, which ASR MeiG modems reject. Enabling no longer fails at boot, after ModemManager restarts or after inhibition.
+- Add a udev rule that binds the `option` driver to the ECM variant `2dee:4d58`, which the kernel doesn't know.
+- Tested on a Teltonika TRM200 in RNDIS and ECM mode: connects via NetworkManager, IPv4 data works.
 - Version releases as `<ModemManager version>-<revision>`. The first release will be `1.24.0-1`.
 - Write `BUILDINFO` as shell-sourceable, so the image build reads the required `modemmanager` version from it.

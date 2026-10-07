@@ -1,0 +1,7 @@
+# MeiG SLM770A in ECM mode (AT+SER=2): the kernel's option driver only knows
+# the RNDIS variant (2dee:4d57). Without this, the vendor-class serial ports of
+# 2dee:4d58 stay unbound and only the cdc_ether network interface comes up.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", \
+  ATTR{idVendor}=="2dee", ATTR{idProduct}=="4d58", \
+  RUN+="/sbin/modprobe option", \
+  RUN+="/bin/sh -c 'echo 2dee 4d58 ff > /sys/bus/usb-serial/drivers/option1/new_id'"

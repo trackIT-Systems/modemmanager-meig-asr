@@ -30,6 +30,14 @@ can't connect:
 Port layout (all variants): if 2 ASR DIAG (ignored), if 3 AT primary,
 if 4 AT secondary, if 5 GPS.
 
+The kernel's `option` driver only knows `2dee:4d57`. For ECM mode,
+`udev/70-meig-slm770a-ecm-option.rules` adds `2dee:4d58` to `option` at
+runtime. Without it, only the `cdc_ether` interface comes up and the AT ports
+stay unbound.
+
+Switching a TRM200 between modes is persistent and reboots the modem:
+`AT+SER=2,1` (ECM, `cdc_ether`) or `AT+SER=3,1` (RNDIS, `rndis_host`, factory default).
+
 ## Where the code comes from
 
 `patches/` is applied on top of upstream ModemManager `1.24.0`
@@ -41,6 +49,7 @@ if 4 AT secondary, if 5 GPS.
 | 0005 | local: plugin-private copy of `mm_3gpp_normalize_address()`, which only exists in MM `main` and isn't exported by the 1.24 daemon |
 | 0006 | local: adds the RNDIS variant `2dee:4d57` (TRM200) |
 | 0007 | local: `MM_DEFINE_SHARED` for `shared-asr`/`shared-meig`. The MR lacks it, so these modules don't load unless plugins are built in |
+| 0008 | local: skip the `ATZ` init, which the modem answers with `ERROR`. Otherwise enabling fails at boot, after MM restarts and after inhibition |
 
 `build.sh` also makes `libmm-shared-meig.so` depend on `libmm-shared-asr.so`
 (`DT_NEEDED` + `RUNPATH=$ORIGIN`). ModemManager opens shared modules in
@@ -61,6 +70,7 @@ usr/lib/aarch64-linux-gnu/ModemManager/libmm-plugin-meig-asr.so
 usr/lib/aarch64-linux-gnu/ModemManager/libmm-plugin-teltonika-meig-asr.so
 usr/lib/aarch64-linux-gnu/ModemManager/libmm-shared-asr.so
 usr/lib/aarch64-linux-gnu/ModemManager/libmm-shared-meig.so
+usr/lib/udev/rules.d/70-meig-slm770a-ecm-option.rules
 usr/lib/udev/rules.d/77-mm-meig-port-types.rules
 usr/lib/udev/rules.d/77-mm-teltonika-port-types.rules
 usr/share/doc/modemmanager-meig-asr/{BUILDINFO,README.md,LICENSE}
@@ -144,14 +154,18 @@ arm64 tarball and attaches it to a GitHub (pre)release.
 Tested on a Teltonika TRM200 (firmware `SLM770A_A.57.3_EQ102`) on a Raspberry Pi 5
 with tsOS and Debian's `modemmanager 1.24.0-1+deb13u1`:
 
-* The `meig-asr` plugin claims `2dee:4d57`. The modem reports LTE, the packet
-  service is attached, and NetworkManager connects with a normal `gsm`
+* The `meig-asr` plugin claims the modem in both modes, RNDIS (`2dee:4d57`,
+  `rndis_host`) and ECM (`2dee:4d58`, `cdc_ether`). The modem reports LTE, the
+  packet service is attached, and NetworkManager connects with a normal `gsm`
   profile (APN only).
 * The plugin dials with `+CGDCONT`/`+CGACT` on cid 2. `usb0` gets a DHCP lease
-  with a /30 or /29 and a real gateway in the carrier network, so there's no
-  clash with the tsOS hotspot. `169.254.0.1` is only the DHCP server identifier.
-* IPv4 traffic works (ping, HTTPS).
-* Enabling works whether or not the modem was hot-plugged. `ATZ` isn't sent.
+  with a /30, /29 or /26 and a real gateway in the carrier network, so there's no
+  clash with the tsOS hotspot. `169.254.0.1` is only the DHCP server identifier,
+  in both modes.
+* IPv4 traffic works (ping, HTTPS). A 2 MB download ran at ~4.7 Mbit/s over ECM
+  and ~3.8 Mbit/s over RNDIS (single samples, LTE Cat 1, roaming).
+* Enabling works at hot-plug, after a ModemManager restart and after
+  inhibition, because `ATZ` isn't sent.
 
 Known issues:
 
@@ -160,8 +174,10 @@ Known issues:
 * `ttyUSB3` (GPS) is reported as an unhandled port. There's no location support yet.
 * No global IPv6 address on `usb0` with an `ipv4v6` context.
 * On a Pi 5 with the default 600 mA USB current limit, the USB power switch
-  tripped (`over-current change` on all ports) several times and the modem
-  re-enumerated. That's a power-supply issue, not a plugin issue.
+  tripped (`over-current change` on all ports) several times, mostly under
+  data load, and the modem re-enumerated. ModemManager and NetworkManager
+  reconnected on their own within ~40 s. That's a power-supply issue, not a
+  plugin issue.
 
 ## License
 

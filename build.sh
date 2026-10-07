@@ -77,6 +77,7 @@ patchelf --add-needed libmm-shared-asr.so --set-rpath '$ORIGIN' \
 for rule in $RULES; do
     install -m 644 "$SRC/src/plugins/$rule" "$UDEVDIR/"
 done
+install -m 644 "$TOP"/udev/*.rules "$UDEVDIR/"
 install -m 644 "$TOP/README.md" "$TOP/LICENSE" "$DOCDIR/"
 
 # Shell-sourceable: the tsOS Pifile reads mm_debian_version from it
