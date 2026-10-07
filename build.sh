@@ -98,7 +98,7 @@ done
 install -m 644 "$TOP"/udev/*.rules "$UDEVDIR/"
 
 # Documentation, as required by Debian policy
-install -m 644 "$TOP/README.md" "$DOCDIR/"
+install -m 644 "$TOP/README.md" "$TOP/docs/TRM200.md" "$DOCDIR/"
 cat > "$DOCDIR/copyright" <<EOF
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: ModemManager

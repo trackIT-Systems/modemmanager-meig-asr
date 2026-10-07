@@ -55,6 +55,13 @@ sudo nmcli connection add type gsm ifname '*' con-name cellular apn <your-apn>
 NetworkManager connects automatically. The modem's network interface
 (`usb0`) gets an address by DHCP.
 
+> [!IMPORTANT]
+> **The plugin changes the modem's stored configuration.** It turns the
+> modem's auto-dial off (`AT+DIALMODE=1`). A factory-new TRM200 dials on its
+> own at power-on; after the plugin has run, it no longer does, even after
+> this package is removed or the modem is used on another host. To restore
+> auto-dial, send `AT+DIALMODE=0`. See [docs/TRM200.md](docs/TRM200.md#the-plugin-changes-the-modems-configuration).
+
 ### In image builds
 
 The package can be installed in a chroot, e.g. with
@@ -107,6 +114,10 @@ Wait for a release of this repository for the new version, or build one (see
 * **Addresses:** the modem's DHCP server identifies itself as `169.254.0.1`, but
   the router it hands out is in the carrier network (e.g. a /29), so it doesn't
   clash with link-local setups on other interfaces.
+
+More hardware and firmware details (USB boot stage, dial settings, `+ECMDUP`
+quirks, unsupported AT commands, how to test a change) are in
+[docs/TRM200.md](docs/TRM200.md).
 
 ## Background
 
@@ -210,7 +221,7 @@ usr/lib/aarch64-linux-gnu/ModemManager/libmm-shared-meig.so
 usr/lib/udev/rules.d/70-meig-slm770a-ecm-option.rules
 usr/lib/udev/rules.d/77-mm-meig-port-types.rules
 usr/lib/udev/rules.d/77-mm-teltonika-port-types.rules
-usr/share/doc/modemmanager-meig-asr/{README.md,copyright,changelog.Debian.gz}
+usr/share/doc/modemmanager-meig-asr/{README.md,TRM200.md,copyright,changelog.Debian.gz}
 ```
 
 It refuses to run if `build/` exists; remove it for a fresh build.
