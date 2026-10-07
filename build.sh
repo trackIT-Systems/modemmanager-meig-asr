@@ -73,13 +73,14 @@ for rule in $RULES; do
 done
 install -m 644 "$TOP/README.md" "$TOP/LICENSE" "$DOCDIR/"
 
+# Shell-sourceable: the tsOS Pifile reads mm_debian_version from it
 cat > "$DOCDIR/BUILDINFO" <<EOF
-name=$NAME
-version=$VERSION
-arch=$ARCH
-mm_tag=$MM_TAG
-mm_commit=$MM_COMMIT
-mm_debian_version=$MM_DEBIAN_VERSION
+name='$NAME'
+version='$VERSION'
+arch='$ARCH'
+mm_tag='$MM_TAG'
+mm_commit='$MM_COMMIT'
+mm_debian_version='$MM_DEBIAN_VERSION'
 EOF
 
 # Files only, no directory entries: extracting onto / must not touch the

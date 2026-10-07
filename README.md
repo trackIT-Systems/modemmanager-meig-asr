@@ -70,13 +70,15 @@ In `tsOS-base.Pifile`, after the software installation:
 
 ```sh
 # Install ModemManager plugins for ASR/MeiG modems (Teltonika TRM200)
-MM_MEIG_ASR_VERSION=v0.1.0
-RUN sh -c 'test "$(dpkg-query -W -f="\${Version}" modemmanager)" = "1.24.0-1+deb13u1"'
+MM_MEIG_ASR_VERSION=1.24.0-1
 RUN sh -c "curl -fsSL https://github.com/trackIT-Systems/modemmanager-meig-asr/releases/download/${MM_MEIG_ASR_VERSION}/modemmanager-meig-asr-${MM_MEIG_ASR_VERSION}-${ARCH}.tar.gz | tar xz -C /"
+RUN sh -c '. /usr/share/doc/modemmanager-meig-asr/BUILDINFO && test "$(dpkg-query -W -f="\${Version}" modemmanager)" = "$mm_debian_version"'
 ```
 
-The first `RUN` fails the image build if the image's ModemManager no longer
-matches the version the plugins were built for. In that case, see below.
+The second `RUN` reads the ModemManager version the plugins were built for from
+`BUILDINFO`. It fails the image build if the image's `modemmanager` doesn't match
+it. In that case, see below. Upgrading the plugins only means changing
+`MM_MEIG_ASR_VERSION`.
 
 ## When Debian updates ModemManager
 
@@ -88,8 +90,8 @@ version. When the image gets a new `modemmanager`:
    `src/plugins/`.
 2. Rebase `patches/` if needed (`git am` onto the new tag, then
    `git format-patch --zero-commit --no-signature <tag>..HEAD`).
-3. Tag a release, then update `MM_MEIG_ASR_VERSION` and the version check in the
-   Pifile.
+3. Tag a release (see [Versioning](#versioning)), then update
+   `MM_MEIG_ASR_VERSION` in the Pifile.
 
 Once MR !1502 is merged and shipped by Debian, this repository is obsolete.
 
@@ -110,9 +112,25 @@ apt-get install --no-install-recommends \
 
 `build.sh` refuses to run if `build/` exists. Remove it for a fresh build.
 
+## Versioning
+
+Releases are tagged `<ModemManager version>-<revision>`, like Debian package
+revisions:
+
+```
+1.24.0-1   first release for ModemManager 1.24.0
+1.24.0-2   our own changes (fixes, new USB IDs, ...) or a Debian-only update
+           of ModemManager 1.24.0 (e.g. +deb13u2), still for 1.24.0
+1.26.0-1   rebuilt for ModemManager 1.26.0, revision starts again at 1
+```
+
+The tag tells you which ModemManager a release loads into. The exact Debian
+version it was checked against is in `versions.env` and in the tarball's
+`BUILDINFO`. Tags have no `v` prefix.
+
 ## Releasing
 
-Add a `## [<tag>]` section to `CHANGELOG.md`, then push a tag. CI builds the
+Add a `## [<tag>]` section to `CHANGELOG.md`, then push the tag. CI builds the
 arm64 tarball and attaches it to a GitHub (pre)release.
 
 ## Status
